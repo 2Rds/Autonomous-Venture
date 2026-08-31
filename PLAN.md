@@ -149,6 +149,24 @@ Each additional site costs setup time on a reusable engine, not new ongoing effo
   works, not just that the files exist). No content has been written yet; `_template.md` is
   deliberately excluded from the build.
 
+- **2026-08-31:** Agent rebuilt as a Python/`claude_agent_sdk` service on a dedicated droplet
+  (see `agent/README.md`), Max-plan auth, Telegram interface live. Added `draft`/`send` for
+  email (AgentMail, live-verified) and affiliate-program applications — with no send/submit path
+  for applications at all, ever, matching the boundary below.
+
+- **2026-08-31: `creatorstacked.com` registered at Porkbun.** Worth recording why this took three
+  spend-request cycles and ended with Sean doing the actual checkout, not the agent: the Link
+  spend-request flow authorizes *money*, but completing a registrar purchase also means creating
+  an account there (email, ToS, WHOIS contact) — the same category of action already ruled out
+  for the affiliate-program applications earlier in this doc. That wasn't obvious until Sean
+  pushed on it directly ("get me there in a chrome browser") and the inconsistency surfaced: the
+  original plan described "get the card, then complete checkout via browser automation" without
+  having worked through that checkout *is* account creation. Corrected mid-session rather than
+  left inconsistent. Going forward: the agent can request spend and can navigate a browser to a
+  page, but signing up for anything third-party stays Sean's action, full stop — see
+  `agent/README.md` "Trust ladder" for where this is enforced in code (the `draft application`
+  path has no `send`).
+
 ## What's next, concretely
 
 I can proceed right now, with no further input, on:

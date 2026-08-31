@@ -12,11 +12,14 @@ actually is (automated content + recurring-affiliate site for course-creator/coa
 - `PLAN.md` — the plan, the niches rejected and why, the honest revenue math, and the scope
   boundaries the agent operates under.
 
-## Status as of 2026-08-30
+## Status as of 2026-08-31
 
-- Domain (`creatorstacked.com`) purchase is pending — a Link spend-request is awaiting approval,
-  nothing charged yet.
-- Site scaffold builds clean, zero content written.
-- Agent: code written, tests pass (16/16), guards mutation-verified. Not deployed — waiting on a
-  free droplet slot on the DO account (at its 3-droplet cap, consolidation in progress), a
-  Telegram bot token, and `CLAUDE_CODE_OAUTH_TOKEN`. None of those exist yet.
+- **`creatorstacked.com` is registered** (Porkbun) — purchased by Sean directly, not automated;
+  see PLAN.md "Progress log" for why domain-registrar signup falls under the same
+  account-creation boundary as the affiliate-program applications.
+- Site scaffold builds clean, zero content written, **not deployed anywhere yet** — the domain
+  currently points at nothing. Next real step: pick a host (Vercel was the working assumption in
+  PLAN.md Phase 1) and point DNS at it.
+- Agent: live and running on its own droplet (`creatorstacked-agent`), Telegram bot responding,
+  30/30 tests pass, guards mutation-verified, send pipeline (AgentMail) live-verified against the
+  real API. `draft`/`send`/`spend`/`status`/`pause`/`resume` all working.
