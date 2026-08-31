@@ -4,4 +4,5 @@ node_modules/
 .dev.vars
 *.env
 .env.*
+!.env.example
 *credentials*.json

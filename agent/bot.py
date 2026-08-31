@@ -5,24 +5,34 @@ the conversation text, same guardrail pattern the rest of the fleet uses (see da
 Real capability is a small set of operator-only commands, each a hand-written function, not
 something the chat model can invoke itself:
 
-  status  — repo state + open Link spend-requests
-  spend   — create a Link spend-request (money moves only after Sean approves it himself in
-            the Link app — this process never holds a card or funds, see _create_spend_request)
-  pause / resume — kill switch; gates `spend` and free-form chat, never the commands themselves
+  status            — repo state + open Link spend-requests
+  spend             — create a Link spend-request (money moves only after Sean approves it
+                       himself in the Link app — see _create_spend_request)
+  draft email       — a separate, WebFetch-enabled Claude call drafts an email; produces a
+                       draft only, sends nothing (see _draft_options)
+  draft application — same, but for an affiliate-program application. THERE IS NO SEND PATH
+                       FOR THIS ONE, by design: submitting an account/application on a
+                       third-party platform is never something this process does, approved
+                       or not — see _handle_send. Sean copies the draft into the form himself.
+  send <id>         — sends an `email`-kind draft via AgentMail, after Sean has seen it here
+                       first. Refuses `application`-kind drafts unconditionally.
+  drafts            — list open (unsent) drafts
+  pause / resume    — kill switch; gates spend/draft/send/chat, never the commands themselves
 
 Scope is fixed: content/affiliate for course-creator/coaching tools only. See ../PLAN.md.
-Widening scope (a new business domain, direct payment processing, tool access for the chat
-model, autonomous LLM-initiated spend-requests instead of the operator command above) is a
-deliberate later step on the trust ladder, not something this bot does on its own — see
-README "Trust ladder".
+Widening scope further (a new business domain, direct payment processing, autonomous
+LLM-initiated spend or send instead of an operator-issued command) is a deliberate later step
+on the trust ladder, not something this bot does on its own — see README "Trust ladder".
 """
 
 import json
 import logging
 import os
 import subprocess
+import uuid
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
@@ -41,7 +51,14 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 DATA_DIR = Path(__file__).parent / ".data"
 STATE_FILE = DATA_DIR / "state.json"
+DRAFTS_DIR = DATA_DIR / "drafts"
 REPO_ROOT = Path(__file__).resolve().parents[1]  # .../Autonomous-Venture
+
+# Optional — drafting works without these, `send` doesn't. Missing means "feature off",
+# same fail-soft-per-source pattern as the rest of the fleet (e.g. daily-brief), not a
+# startup crash for a capability Sean hasn't finished wiring up yet.
+AGENTMAIL_API_KEY = os.environ.get("AGENTMAIL_API_KEY", "").strip()
+AGENTMAIL_INBOX_ID = os.environ.get("AGENTMAIL_INBOX_ID", "").strip()
 
 SCOPE_PROMPT = """You are the operating agent for CreatorStacked (creatorstacked.com), an
 automated content + recurring-affiliate site for online course creators and coaches (Kajabi,
@@ -64,6 +81,11 @@ HELP_TEXT = (
     "`status` — repo state + open spend-requests\n"
     "`spend <dollars>|<merchant>|<merchant url>|<reason>` — request a purchase "
     "(needs your approval in the Link app before anything is charged)\n"
+    "`draft email <to>|<subject>|<brief>` — draft an email (sends nothing)\n"
+    "`draft application <program>|<program url>` — draft affiliate-program application "
+    "answers for you to submit yourself (there is no send for this one, ever)\n"
+    "`send <id>` — send an email draft via AgentMail (only works on `email` drafts)\n"
+    "`drafts` — list open drafts\n"
     "`pause` / `resume` — kill switch\n"
     "Anything else is a normal chat message to the agent (read-only — it can't act on it)."
 )
@@ -153,6 +175,154 @@ async def _ask_claude(prompt: str) -> str:
     return "\n".join(parts) if parts else "(no response)"
 
 
+# ---------------------------------------------------------------- claude (drafting)
+
+def _draft_options() -> ClaudeAgentOptions:
+    # Same three-layer guardrail as _claude_options(), except WebFetch is deliberately left
+    # OUT of the disallow list — the one tool this call gets, so a draft can be grounded in a
+    # real page instead of a guess. Everything that could actually submit/send/write anything
+    # is still disallowed; drafting produces text, nothing else, regardless of what it looked up.
+    return ClaudeAgentOptions(
+        system_prompt=SCOPE_PROMPT + "\n\nYou are drafting text only — an email or an "
+                      "affiliate-program application — never sending or submitting anything "
+                      "yourself; a human does that after reading your draft. Use WebFetch to "
+                      "check any factual claim about a program or recipient before writing it "
+                      "down; never state something as fact you have not looked up this session.",
+        permission_mode="dontAsk",
+        setting_sources=[],
+        strict_mcp_config=True,
+        disallowed_tools=["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
+                          "Read", "Grep", "Glob", "WebSearch",
+                          "Task", "Agent", "TodoWrite", "SlashCommand", "Skill",
+                          "BashOutput", "KillShell", "ExitPlanMode",
+                          "EnterPlanMode", "AskUserQuestion", "Artifact",
+                          "ToolSearch", "Monitor", "EnterWorktree",
+                          "ExitWorktree"],  # WebFetch intentionally absent from this list
+        max_turns=int(os.environ.get("MAX_TURNS", "8")),
+        model=os.environ.get("AGENT_MODEL", "claude-sonnet-5"),
+        effort=os.environ.get("AGENT_EFFORT", "medium"),
+    )
+
+
+async def _run_draft(prompt: str) -> str:
+    parts: list[str] = []
+    async with ClaudeSDKClient(options=_draft_options()) as client:
+        await client.query(prompt)
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        parts.append(block.text)
+    return "\n".join(parts) if parts else "(no draft produced)"
+
+
+# ---------------------------------------------------------------- draft storage
+
+def _save_draft(kind: str, meta: dict, body: str) -> str:
+    DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    draft_id = uuid.uuid4().hex[:8]
+    record = {"id": draft_id, "kind": kind, "status": "draft", "body": body, **meta}
+    (DRAFTS_DIR / f"{draft_id}.json").write_text(json.dumps(record, indent=2))
+    return draft_id
+
+
+def _load_draft(draft_id: str) -> dict | None:
+    path = DRAFTS_DIR / f"{draft_id}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _mark_draft_sent(draft: dict) -> None:
+    draft["status"] = "sent"
+    (DRAFTS_DIR / f"{draft['id']}.json").write_text(json.dumps(draft, indent=2))
+
+
+def _list_open_drafts() -> list[dict]:
+    DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    drafts = []
+    for f in sorted(DRAFTS_DIR.glob("*.json")):
+        try:
+            d = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if d.get("status") == "draft":
+            drafts.append(d)
+    return drafts
+
+
+def _handle_drafts_list() -> str:
+    drafts = _list_open_drafts()
+    if not drafts:
+        return "No open drafts."
+    return "\n".join(
+        f"`{d['id']}` [{d['kind']}] " + (d.get("to") or d.get("program", ""))
+        for d in drafts
+    )
+
+
+# ---------------------------------------------------------------- draft / send commands
+
+async def _handle_draft_email(arg: str) -> str:
+    parts = [p.strip() for p in arg.split("|")]
+    if len(parts) != 3:
+        return ("Format: `draft email <to>|<subject>|<brief>`\n"
+                 "e.g. `draft email partners@kajabi.com|Affiliate partnership inquiry|"
+                 "ask about joining their affiliate program for a course-creator tools "
+                 "review site`")
+    to, subject, brief = parts
+    prompt = (f"Draft an email.\nTo: {to}\nSubject: {subject}\nBrief: {brief}\n\n"
+              f"Write only the email body (plain text, no subject line repeated in the "
+              f"body). Sign off as the CreatorStacked team, creatorstacked@agentmail.to.")
+    body = await _run_draft(prompt)
+    draft_id = _save_draft("email", {"to": to, "subject": subject}, body)
+    return (f"Draft `{draft_id}` (email to {to}):\n\n{body}\n\n"
+            f"`send {draft_id}` to send as-is, or just tell me what to change.")
+
+
+async def _handle_draft_application(arg: str) -> str:
+    parts = [p.strip() for p in arg.split("|")]
+    if len(parts) != 2:
+        return ("Format: `draft application <program name>|<program url>`\n"
+                 "e.g. `draft application Kajabi|https://kajabi.com/affiliates`")
+    program, url = parts
+    prompt = (f"Look up {url} and draft answers for {program}'s affiliate program "
+              f"application, as CreatorStacked (creatorstacked.com, "
+              f"creatorstacked@agentmail.to) — a content site reviewing tools for online "
+              f"course creators and coaches. Only state facts about {program} you actually "
+              f"found at that URL; say plainly if the page didn't have what you needed.")
+    body = await _run_draft(prompt)
+    draft_id = _save_draft("application", {"program": program, "url": url}, body)
+    return (f"Draft `{draft_id}` (application to {program}) — for you to submit yourself, "
+            f"there is no `send` for this one:\n\n{body}")
+
+
+async def _handle_send(draft_id: str) -> str:
+    draft_id = draft_id.strip()
+    draft = _load_draft(draft_id)
+    if draft is None or draft.get("status") != "draft":
+        return f"No open draft `{draft_id}`."
+    if draft["kind"] != "email":
+        return ("Applications don't get an automated send — submitting an account or "
+                 "application on a third-party platform is never something this agent "
+                 "does, approved or not. Copy the draft into the form yourself.")
+    if not AGENTMAIL_API_KEY or not AGENTMAIL_INBOX_ID:
+        return "AGENTMAIL_API_KEY / AGENTMAIL_INBOX_ID not configured yet — can't send."
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"https://api.agentmail.to/v0/inboxes/{AGENTMAIL_INBOX_ID}/messages/send",
+            headers={"Authorization": f"Bearer {AGENTMAIL_API_KEY}"},
+            json={"to": draft["to"], "subject": draft["subject"], "text": draft["body"]},
+        )
+    if resp.status_code != 200:
+        return f"Send failed ({resp.status_code}): {resp.text[:300]}"
+    _mark_draft_sent(draft)
+    return f"Sent `{draft_id}` to {draft['to']}."
+
+
 # ---------------------------------------------------------------- link-cli (spend-requests)
 
 def _create_spend_request(amount_cents: int, merchant_name: str, merchant_url: str, reason: str) -> str:
@@ -220,6 +390,8 @@ async def _route(text: str) -> str:
     # just a mood.
     if lowered == "status":
         return _handle_status()
+    if lowered == "drafts":
+        return _handle_drafts_list()
     if lowered == "pause":
         _state["paused"] = True
         ok = _save_state()
@@ -232,10 +404,17 @@ async def _route(text: str) -> str:
         return HELP_TEXT
 
     if _state["paused"]:
-        return "Paused — `resume` to re-enable spend requests and chat. `status`/`resume`/`help` still work."
+        return ("Paused — `resume` to re-enable spend/draft/send and chat. "
+                 "`status`/`drafts`/`resume`/`help` still work.")
 
     if lowered.startswith("spend "):
         return _handle_spend(text[len("spend "):])
+    if lowered.startswith("draft email "):
+        return await _handle_draft_email(text[len("draft email "):])
+    if lowered.startswith("draft application "):
+        return await _handle_draft_application(text[len("draft application "):])
+    if lowered.startswith("send "):
+        return await _handle_send(text[len("send "):])
 
     return await _ask_claude(text)
 

@@ -21,12 +21,23 @@ which a Workers V8 isolate cannot do. Matching the fleet's auth meant matching i
   tool the chat model can call itself. Every purchase this bot ever requests traces back to an
   explicit `spend` command, and even then nothing is charged until Sean approves it himself in
   the Link app.
-- **`pause` is a real kill switch.** It gates both `spend` and free-form chat; `status`,
-  `pause`, `resume`, `help` always work regardless.
-- **Next rung, not built yet:** letting the chat model decide to create spend-requests on its
-  own mid-conversation (an in-process tool wrapping `_create_spend_request`) instead of waiting
-  for the operator to type `spend`. That's a deliberate later step once this stage is proven,
-  not an oversight.
+- **Drafting is a separate, WebFetch-only Claude call — `_draft_options()`, not
+  `_claude_options()`.** `draft email` and `draft application` can look up a real page to
+  ground what they write, but still can't write a file, run a command, or touch an MCP server.
+  Every other tool stays disallowed regardless of what the draft needed to look up.
+- **Sending is not the same trust level as drafting, and the two commands are not symmetric
+  on purpose.** `send <id>` sends an `email`-kind draft via AgentMail — but only after the
+  draft has been shown to Sean here first, and only him deciding to send it. There is **no
+  send path at all for `application`-kind drafts** — `_handle_send` refuses them
+  unconditionally, every time, regardless of approval. Submitting an account or application on
+  a third-party platform is not something this process automates at any trust stage; Sean
+  copies the draft into the form himself. This is a hard line, not a staged one — see
+  `../PLAN.md` "Progress log" for why.
+- **`pause` is a real kill switch.** It gates `spend`, `draft`, `send`, and free-form chat;
+  `status`, `drafts`, `pause`, `resume`, `help` always work regardless.
+- **Next rung, not built yet:** letting the chat model decide to create spend-requests or
+  drafts on its own mid-conversation (in-process tools) instead of waiting for the operator to
+  type a command. That's a deliberate later step once this stage is proven, not an oversight.
 
 ## Setup (needs you — none of this exists yet)
 
@@ -40,13 +51,17 @@ which a Workers V8 isolate cannot do. Matching the fleet's auth meant matching i
    subscription, run `claude setup-token` → put the result in `CLAUDE_CODE_OAUTH_TOKEN`.
 4. **`link-cli` on the droplet**: install `@stripe/link-cli` and authenticate it there —
    it has its own session, separate from the one on your laptop. I can't do this step; it's
-   your identity being authenticated.
-5. On the droplet, `/opt/creatorstacked/agent`:
+   your identity being authenticated. Use an isolated Link account scoped to one card, not
+   your personal wallet.
+5. **AgentMail** (optional — only needed for `send`, not for `draft`): create the inbox, get
+   an API key and the inbox's `inbox_id` from the dashboard (not necessarily the email address
+   itself) for `AGENTMAIL_API_KEY` / `AGENTMAIL_INBOX_ID`.
+6. On the droplet, `/opt/creatorstacked/agent`:
    ```
    git clone <this repo> .   # or git pull if already cloned
    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
    ```
-6. Write `.env` from `.env.example` (paste secrets on a real TTY), `chown agentbot`,
+7. Write `.env` from `.env.example` (paste secrets on a real TTY), `chown agentbot`,
    `chmod 600 .env`.
 7. `mkdir .data && chown agentbot .data` — must exist before first start (the unit's
    `ReadWritePaths` lists it).
