@@ -1,3 +1,4 @@
+import asyncio
 import json
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -240,11 +241,23 @@ async def test_draft_application_bad_format_skips_claude_call():
 
 @pytest.mark.asyncio
 async def test_draft_application_valid_saves_draft_with_no_send_mentioned():
-    with patch.object(bot, "_run_draft", return_value="Answers here"):
-        result = await bot._handle_draft_application("Kajabi|https://kajabi.com/affiliates")
+    with patch.object(bot, "_browser_fetch", return_value=(True, "Kajabi affiliate terms: 30%")):
+        with patch.object(bot, "_run_draft", return_value="Answers here") as mock_draft:
+            result = await bot._handle_draft_application("Kajabi|https://kajabi.com/affiliates")
     assert "no `send`" in result
+    assert "Kajabi affiliate terms: 30%" in mock_draft.call_args[0][0]
     drafts = bot._list_open_drafts()
     assert drafts[0]["kind"] == "application"
+
+
+@pytest.mark.asyncio
+async def test_draft_application_fetch_failure_still_drafts_with_failure_noted():
+    with patch.object(bot, "_browser_fetch", return_value=(False, "timed out")):
+        with patch.object(bot, "_run_draft", return_value="Answers here") as mock_draft:
+            await bot._handle_draft_application("Kajabi|https://kajabi.com/affiliates")
+    prompt = mock_draft.call_args[0][0]
+    assert "Could not fetch" in prompt
+    assert "timed out" in prompt
 
 
 @pytest.mark.asyncio
@@ -339,6 +352,52 @@ async def test_route_drafts_list_works_while_paused():
     assert result == "listed"
 
 
+# ---------------------------------------------------------------- browser run
+
+class _FakeProc:
+    def __init__(self, returncode, stdout=b"", stderr=b""):
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+
+    async def communicate(self):
+        return self._stdout, self._stderr
+
+
+@pytest.mark.asyncio
+async def test_browser_fetch_success():
+    with patch.object(asyncio, "create_subprocess_exec",
+                      return_value=_FakeProc(0, stdout=b"URL: x\n\npage text")):
+        ok, content = await bot._browser_fetch("https://example.com")
+    assert ok is True
+    assert content == "URL: x\n\npage text"
+
+
+@pytest.mark.asyncio
+async def test_browser_fetch_nonzero_exit_returns_stderr():
+    with patch.object(asyncio, "create_subprocess_exec",
+                      return_value=_FakeProc(2, stderr=b"refused: only http/https URLs")):
+        ok, content = await bot._browser_fetch("ftp://example.com")
+    assert ok is False
+    assert "refused" in content
+
+
+@pytest.mark.asyncio
+async def test_browser_fetch_timeout_returns_failure_not_exception():
+    async def fake_exec(*a, **kw):
+        return _FakeProc(0)
+
+    async def fake_wait_for(coro, timeout):
+        coro.close()  # avoid an unawaited-coroutine warning from the one wait_for would have run
+        raise asyncio.TimeoutError()
+
+    with patch.object(asyncio, "create_subprocess_exec", side_effect=fake_exec):
+        with patch.object(asyncio, "wait_for", side_effect=fake_wait_for):
+            ok, content = await bot._browser_fetch("https://example.com")
+    assert ok is False
+    assert "browser_run" in content
+
+
 # ---------------------------------------------------------------- content pipeline
 
 VALID_ARTICLE_RAW = """TITLE: Best Course Platform for Fitness Coaches
@@ -391,6 +450,108 @@ def test_existing_slugs_excludes_underscore_files(tmp_path):
 
 def test_existing_slugs_empty_when_dir_missing():
     assert bot._existing_slugs() == []
+
+
+VALID_PLAN_RAW = """TOPIC: Comparing community feature limits for cohort-based creators
+PERSONA: cohort-creators
+URLS:
+https://www.kajabi.com/pricing
+https://www.podia.com/pricing
+"""
+
+
+def test_parse_plan_valid():
+    plan = bot._parse_plan(VALID_PLAN_RAW)
+    assert plan["persona"] == "cohort-creators"
+    assert plan["urls"] == ["https://www.kajabi.com/pricing", "https://www.podia.com/pricing"]
+
+
+def test_parse_plan_missing_fields_returns_none():
+    assert bot._parse_plan("TOPIC: only a topic\nno other fields") is None
+
+
+def test_parse_plan_no_valid_urls_returns_none():
+    raw = VALID_PLAN_RAW.replace(
+        "https://www.kajabi.com/pricing\nhttps://www.podia.com/pricing",
+        "not a url\nalso not a url",
+    )
+    assert bot._parse_plan(raw) is None
+
+
+def test_parse_plan_caps_at_four_urls():
+    raw = "TOPIC: x\nPERSONA: consultants\nURLS:\n" + "\n".join(
+        f"https://example.com/{i}" for i in range(6)
+    )
+    plan = bot._parse_plan(raw)
+    assert len(plan["urls"]) == 4
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_research_fetches_each_planned_url_then_writes():
+    fetch_calls = []
+
+    async def fake_fetch(url, max_chars=4000):
+        fetch_calls.append(url)
+        return True, f"content for {url}"
+
+    llm_calls = []
+
+    async def fake_llm(system_prompt, user_prompt):
+        llm_calls.append((system_prompt, user_prompt))
+        if system_prompt == bot._PIPELINE_PLANNER_PROMPT:
+            return VALID_PLAN_RAW
+        return "TITLE: x\nSLUG: x\nDESCRIPTION: x\nPERSONA: cohort-creators\n" \
+               "AFFILIATE_PROGRAM: TBD\nBODY:\nbody text"
+
+    with patch.object(bot, "_browser_fetch", side_effect=fake_fetch):
+        with patch.object(bot, "_run_pipeline_llm", side_effect=fake_llm):
+            result = await bot._run_pipeline_research()
+
+    assert fetch_calls == ["https://www.kajabi.com/pricing", "https://www.podia.com/pricing"]
+    assert len(llm_calls) == 2
+    write_prompt = llm_calls[1][1]
+    assert "content for https://www.kajabi.com/pricing" in write_prompt
+    assert "content for https://www.podia.com/pricing" in write_prompt
+    assert "body text" in result
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_research_reports_failed_fetches_to_writer():
+    async def fake_fetch(url, max_chars=4000):
+        return False, "404 not found"
+
+    async def fake_llm(system_prompt, user_prompt):
+        if system_prompt == bot._PIPELINE_PLANNER_PROMPT:
+            return VALID_PLAN_RAW
+        return user_prompt  # echo back so the test can inspect what the writer actually saw
+
+    with patch.object(bot, "_browser_fetch", side_effect=fake_fetch):
+        with patch.object(bot, "_run_pipeline_llm", side_effect=fake_llm):
+            result = await bot._run_pipeline_research()
+
+    assert "FETCH FAILED" in result
+    assert "404 not found" in result
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_research_unparseable_plan_returns_raw():
+    # fake_llm deliberately returns DIFFERENT text for the two phases, and the test asserts
+    # the call count -- a version that fell through to the writer phase with an empty plan
+    # (instead of actually stopping) would still produce a result, and if the writer's fake
+    # output happened to match the planner's, a same-string mock wouldn't have caught that
+    # (that's exactly the shape of mutation this test failed to catch on its first version).
+    async def fake_llm(system_prompt, user_prompt):
+        if system_prompt == bot._PIPELINE_PLANNER_PROMPT:
+            return "not a valid plan format"
+        return "SHOULD NOT BE CALLED -- writer phase ran despite an unparseable plan"
+
+    with patch.object(bot, "_run_pipeline_llm", side_effect=fake_llm) as mock_llm:
+        with patch.object(bot, "_browser_fetch") as mock_fetch:
+            result = await bot._run_pipeline_research()
+
+    mock_fetch.assert_not_called()
+    assert mock_llm.call_count == 1
+    assert result == "not a valid plan format"
 
 
 def test_write_article_file_always_status_draft():

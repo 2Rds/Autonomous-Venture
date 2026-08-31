@@ -8,9 +8,11 @@ something the chat model can invoke itself:
   status            — repo state + open Link spend-requests
   spend             — create a Link spend-request (money moves only after Sean approves it
                        himself in the Link app — see _create_spend_request)
-  draft email       — a separate, WebFetch-enabled Claude call drafts an email; produces a
-                       draft only, sends nothing (see _draft_options)
-  draft application — same, but for an affiliate-program application. THERE IS NO SEND PATH
+  draft email       — a Claude call drafts an email; produces a draft only, sends nothing
+                       (see _draft_options)
+  draft application — same, but for an affiliate-program application, grounded in a real page
+                       fetched via _browser_fetch (Cloudflare Browser Run — see below, not
+                       WebFetch). THERE IS NO SEND PATH
                        FOR THIS ONE, by design: submitting an account/application on a
                        third-party platform is never something this process does, approved
                        or not — see _handle_send. Sean copies the draft into the form himself.
@@ -28,6 +30,16 @@ This is the durable-autonomy piece: content_pipeline_loop runs inside this same 
 service (Restart=always, its own droplet), not inside any interactive Claude Code session —
 it keeps running whether or not anyone is watching, which is the actual point of it.
 
+Research uses Cloudflare Browser Run (_browser_fetch, a hand-written subprocess call to
+browser_run.py), not the Agent SDK's built-in WebFetch/WebSearch tools — matching the rest of
+Sean's fleet, and it renders JavaScript where WebFetch doesn't. Every Claude call in this file
+is fully tool-less as a result: the model decides WHAT to fetch (a plan with URLs, or a program
+name it's given), hand-written code does the actual fetching and hands the result back in the
+next prompt. This also sidesteps a real bug found live on first deploy: WebFetch/WebSearch
+reported themselves as "blocked" in this headless environment even when merely absent from
+disallowed_tools, and only worked with an explicit allowed_tools entry — Browser Run has no
+such ambiguity since it's not an Agent SDK tool at all, just a subprocess this code controls.
+
 Scope is fixed: content/affiliate for course-creator/coaching tools only. See ../PLAN.md.
 Widening scope further (a new business domain, direct payment processing, autonomous
 LLM-initiated spend or send instead of an operator-issued command, or the pipeline ever
@@ -42,6 +54,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -73,6 +86,7 @@ STATE_FILE = DATA_DIR / "state.json"
 DRAFTS_DIR = DATA_DIR / "drafts"
 REPO_ROOT = Path(__file__).resolve().parents[1]  # .../Autonomous-Venture
 ARTICLES_DIR = REPO_ROOT / "site" / "content" / "articles"
+BROWSER_RUN = Path(__file__).parent / "browser_run.py"
 
 # Optional — drafting works without these, `send` doesn't. Missing means "feature off",
 # same fail-soft-per-source pattern as the rest of the fleet (e.g. daily-brief), not a
@@ -166,6 +180,27 @@ def _save_state() -> bool:
         return False
 
 
+# ---------------------------------------------------------------- browser run (research)
+
+async def _browser_fetch(url: str, max_chars: int = 4000) -> tuple[bool, str]:
+    """Hand-written, not model-invoked -- same reasoning as _create_spend_request. The model
+    decides WHAT to fetch (a URL string in its own output); this function is the only thing
+    that actually talks to the network, via Cloudflare Browser Run (browser_run.py), not
+    WebFetch/WebSearch. See module docstring for why."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(BROWSER_RUN), url, "--text", "--max-chars", str(max_chars),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except (OSError, asyncio.TimeoutError) as exc:
+        return False, f"browser_run failed to run: {exc}"
+    if proc.returncode != 0:
+        err = stderr.decode(errors="replace").strip()
+        return False, err or f"browser_run exited {proc.returncode}"
+    return True, stdout.decode(errors="replace").strip()
+
+
 # ---------------------------------------------------------------- claude (read-only chat)
 
 def _claude_options() -> ClaudeAgentOptions:
@@ -208,26 +243,25 @@ async def _ask_claude(prompt: str) -> str:
 # ---------------------------------------------------------------- claude (drafting)
 
 def _draft_options() -> ClaudeAgentOptions:
-    # Same three-layer guardrail as _claude_options(), except WebFetch is deliberately left
-    # OUT of the disallow list — the one tool this call gets, so a draft can be grounded in a
-    # real page instead of a guess. Everything that could actually submit/send/write anything
-    # is still disallowed; drafting produces text, nothing else, regardless of what it looked up.
+    # Fully tool-less, same shape as _claude_options(). Any page content a draft needs is
+    # fetched by hand-written code (_browser_fetch, Cloudflare Browser Run) and handed to this
+    # call inside the prompt -- this call never fetches anything itself. See module docstring.
     return ClaudeAgentOptions(
         system_prompt=SCOPE_PROMPT + "\n\nYou are drafting text only — an email or an "
                       "affiliate-program application — never sending or submitting anything "
-                      "yourself; a human does that after reading your draft. Use WebFetch to "
-                      "check any factual claim about a program or recipient before writing it "
-                      "down; never state something as fact you have not looked up this session.",
+                      "yourself; a human does that after reading your draft. Only state a "
+                      "fact about a program or recipient if it is present in page content "
+                      "given to you in this prompt; never state something you were not given.",
         permission_mode="dontAsk",
         setting_sources=[],
         strict_mcp_config=True,
         disallowed_tools=["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
-                          "Read", "Grep", "Glob", "WebSearch",
+                          "Read", "Grep", "Glob", "WebFetch", "WebSearch",
                           "Task", "Agent", "TodoWrite", "SlashCommand", "Skill",
                           "BashOutput", "KillShell", "ExitPlanMode",
                           "EnterPlanMode", "AskUserQuestion", "Artifact",
                           "ToolSearch", "Monitor", "EnterWorktree",
-                          "ExitWorktree"],  # WebFetch intentionally absent from this list
+                          "ExitWorktree"],
         max_turns=int(os.environ.get("MAX_TURNS", "8")),
         model=os.environ.get("AGENT_MODEL", "claude-sonnet-5"),
         effort=os.environ.get("AGENT_EFFORT", "medium"),
@@ -319,11 +353,14 @@ async def _handle_draft_application(arg: str) -> str:
         return ("Format: `draft application <program name>|<program url>`\n"
                  "e.g. `draft application Kajabi|https://kajabi.com/affiliates`")
     program, url = parts
-    prompt = (f"Look up {url} and draft answers for {program}'s affiliate program "
-              f"application, as CreatorStacked (creatorstacked.com, "
-              f"creatorstacked@agentmail.to) — a content site reviewing tools for online "
-              f"course creators and coaches. Only state facts about {program} you actually "
-              f"found at that URL; say plainly if the page didn't have what you needed.")
+    ok, page_content = await _browser_fetch(url)
+    context = (f"Actual page content fetched from {url}:\n\n{page_content}" if ok
+               else f"Could not fetch {url}: {page_content}")
+    prompt = (f"{context}\n\nDraft answers for {program}'s affiliate program application, as "
+              f"CreatorStacked (creatorstacked.com, creatorstacked@agentmail.to) — a content "
+              f"site reviewing tools for online course creators and coaches. Only state facts "
+              f"about {program} that appear in the page content above; say plainly if it "
+              f"didn't have what you needed.")
     body = await _run_draft(prompt)
     draft_id = _save_draft("application", {"program": program, "url": url}, body)
     return (f"Draft `{draft_id}` (application to {program}) — for you to submit yourself, "
@@ -377,28 +414,44 @@ Everything you write goes to a real person who deletes anything that reads like 
 - Commit to one clear claim instead of hedging ("it's worth noting", "arguably" are banned).
 - Before finishing, scan your own draft for em dashes, banned words, negate-then-pivot sentences, and triadic lists; rewrite any hit."""
 
-_PIPELINE_SYSTEM_PROMPT = f"""{SCOPE_PROMPT}
+_PIPELINE_PLANNER_PROMPT = f"""{SCOPE_PROMPT}
 
-You are extending CreatorStacked's content library, unsupervised — this runs on a schedule with
-no one reviewing your topic choice before you research and write. What IS still reviewed by Sean
-before anything goes live is the draft itself (see below), so the discipline here matters more,
-not less, than in a supervised call.
+You are planning the next article for CreatorStacked's content library, unsupervised — this
+runs on a schedule with no one reviewing your topic choice before research happens. What IS
+still reviewed by Sean before anything goes live is the finished draft, so getting the plan
+right matters more here, not less, than in a supervised call.
 
-Personas already established for this site: fitness coaches, music teachers, consultants,
-cohort-based course creators. Programs in scope: Kajabi, Teachable, Podia, Thinkific, and
-similar tools for online course creators and coaches.
+Personas already established: fitness coaches, music teachers, consultants, cohort-based
+course creators. Programs in scope: Kajabi, Teachable, Podia, Thinkific, and similar tools for
+online course creators and coaches.
 
 Pick ONE new, specific, long-tail angle not already covered by the existing article slugs you
 are given. Avoid generic "best tool" listicles — narrow to a persona or a specific decision
 (a pricing tier, a feature gap, a specific comparison) the way the existing articles do.
 
-Research it with WebSearch, then verify every factual claim (pricing, fees, feature limits)
-against the vendor's own page with WebFetch before writing it down. Never state a number or
-feature claim you have not personally verified this session — an aggregator or review site is
-not a source, only the vendor's own page is. If you cannot verify a specific number, write
-around it rather than guess.
+You have no tools here. List 1-4 specific URLs, each a vendor's own page (pricing, features),
+never a review or aggregator site, that would need to be fetched to verify the facts this
+article depends on. Those get fetched for you by a separate process and handed back before you
+write anything, so name exactly what you'd need, not what you already believe to be true.
+
+Output EXACTLY in this format and nothing else:
+
+TOPIC: <one to two sentences describing the specific angle>
+PERSONA: <exactly one of: fitness-coaches, music-teachers, consultants, cohort-creators>
+URLS:
+<url1>
+<url2>"""
+
+_PIPELINE_WRITER_SYSTEM_PROMPT = f"""{SCOPE_PROMPT}
 
 {_WRITING_STYLE_BLOCK}
+
+You are writing one CreatorStacked article now, from a topic plan and real page content fetched
+for you (given in the prompt, not something you fetch yourself — you have no tools here).
+
+Never state a number or feature claim that isn't visible in the fetched content you were given.
+If a fetch failed, or the page didn't contain what the plan expected, write around it rather
+than guess, and say so plainly if it materially limits what the article can claim.
 
 Output EXACTLY in this format and nothing else, no preamble or closing remarks outside it:
 
@@ -411,27 +464,39 @@ BODY:
 <the full article body in markdown, no frontmatter, starting directly with the first paragraph>"""
 
 
-def _pipeline_options() -> ClaudeAgentOptions:
-    # WebFetch and WebSearch only — research and verification, nothing that writes, runs
-    # commands, or touches git. The actual file write and git push are hand-written Python
-    # below (_write_article_file, _git_commit_and_push), never something this call does
-    # itself, same reasoning as _create_spend_request never being a model-invoked tool.
+def _pipeline_options(system_prompt: str) -> ClaudeAgentOptions:
+    # Fully tool-less. Research happens via hand-written _browser_fetch calls (Cloudflare
+    # Browser Run) orchestrated by _run_pipeline_research below, not a tool this call invokes
+    # itself. The file write and git push are hand-written too (_write_article_file,
+    # _git_commit_and_push), same reasoning as _create_spend_request never being model-invoked.
     return ClaudeAgentOptions(
-        system_prompt=_PIPELINE_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         permission_mode="dontAsk",
         setting_sources=[],
         strict_mcp_config=True,
         disallowed_tools=["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
-                          "Read", "Grep", "Glob",
+                          "Read", "Grep", "Glob", "WebFetch", "WebSearch",
                           "Task", "Agent", "TodoWrite", "SlashCommand", "Skill",
                           "BashOutput", "KillShell", "ExitPlanMode",
                           "EnterPlanMode", "AskUserQuestion", "Artifact",
                           "ToolSearch", "Monitor", "EnterWorktree",
-                          "ExitWorktree"],  # WebFetch and WebSearch intentionally absent
+                          "ExitWorktree"],
         max_turns=int(os.environ.get("PIPELINE_MAX_TURNS", "20")),
         model=os.environ.get("AGENT_MODEL", "claude-sonnet-5"),
         effort=os.environ.get("AGENT_EFFORT", "medium"),
     )
+
+
+async def _run_pipeline_llm(system_prompt: str, user_prompt: str) -> str:
+    parts: list[str] = []
+    async with ClaudeSDKClient(options=_pipeline_options(system_prompt)) as client:
+        await client.query(user_prompt)
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        parts.append(block.text)
+    return "\n".join(parts)
 
 
 def _existing_slugs() -> list[str]:
@@ -440,20 +505,49 @@ def _existing_slugs() -> list[str]:
     return sorted(f.stem for f in ARTICLES_DIR.glob("*.md") if not f.stem.startswith("_"))
 
 
+_PLAN_FIELD_RE = re.compile(
+    r"TOPIC:\s*(?P<topic>.+?)\n"
+    r"PERSONA:\s*(?P<persona>.+?)\n"
+    r"URLS:\s*\n(?P<urls>.*)",
+    re.DOTALL,
+)
+
+
+def _parse_plan(raw: str) -> dict | None:
+    match = _PLAN_FIELD_RE.search(raw)
+    if not match:
+        return None
+    fields = {k: v.strip() for k, v in match.groupdict().items()}
+    urls = [line.strip() for line in fields["urls"].splitlines()
+            if line.strip().startswith(("http://", "https://"))]
+    if not urls:
+        return None
+    return {"topic": fields["topic"], "persona": fields["persona"], "urls": urls[:4]}
+
+
 async def _run_pipeline_research() -> str:
     existing = _existing_slugs()
-    prompt = (f"Existing article slugs (do not repeat these topics): "
-              f"{', '.join(existing) if existing else '(none yet)'}\n\n"
-              f"Research and write one new article now.")
-    parts: list[str] = []
-    async with ClaudeSDKClient(options=_pipeline_options()) as client:
-        await client.query(prompt)
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        parts.append(block.text)
-    return "\n".join(parts)
+    plan_prompt = (f"Existing article slugs (do not repeat these topics): "
+                   f"{', '.join(existing) if existing else '(none yet)'}\n\n"
+                   f"Propose the next article now.")
+    plan_raw = await _run_pipeline_llm(_PIPELINE_PLANNER_PROMPT, plan_prompt)
+    plan = _parse_plan(plan_raw)
+    if plan is None:
+        # _run_content_cycle's _parse_article will also fail to parse this (it's not in
+        # TITLE:/SLUG:/... format either), producing the same "didn't parse" message -- one
+        # failure path instead of two, and still an accurate description of what happened.
+        return plan_raw
+
+    fetched_blocks = []
+    for url in plan["urls"]:
+        ok, content = await _browser_fetch(url)
+        status = "OK" if ok else "FETCH FAILED"
+        fetched_blocks.append(f"URL: {url}\n{status}:\n{content[:3000]}")
+    fetched_text = "\n\n---\n\n".join(fetched_blocks) if fetched_blocks else "(no URLs fetched)"
+
+    write_prompt = (f"Topic: {plan['topic']}\nPersona: {plan['persona']}\n\n"
+                    f"Fetched page content:\n\n{fetched_text}\n\nWrite the article now.")
+    return await _run_pipeline_llm(_PIPELINE_WRITER_SYSTEM_PROMPT, write_prompt)
 
 
 _ARTICLE_FIELD_RE = re.compile(

@@ -1,4 +1,6 @@
 .env
+browser_run.env
+browser_usage.jsonl
 .data/
 .venv/
 __pycache__/
