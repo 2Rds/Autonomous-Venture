@@ -1,0 +1,33 @@
+[Unit]
+Description=CreatorStacked agent (Telegram interface)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentbot
+WorkingDirectory=/opt/creatorstacked/agent
+EnvironmentFile=/opt/creatorstacked/agent/.env
+ExecStart=/opt/creatorstacked/agent/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+# The Agent SDK ships a bundled `claude` CLI and prefers it over PATH; link-cli must also
+# be reachable here for the `spend` command (see README setup step 5).
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# Own droplet, nothing else co-located — the cap mostly guards against this bot's own
+# runaway growth, not protecting a neighbor the way the fleet units do.
+MemoryMax=768M
+MemoryHigh=512M
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# .data/ (pause state) must exist before first start — deploy runbook step 4.
+ReadWritePaths=/opt/creatorstacked/agent/.data /home/agentbot
+# Hide the credential file from the process; EnvironmentFile= is read by the manager
+# before namespacing, so the env vars still arrive.
+InaccessiblePaths=-/opt/creatorstacked/agent/.env
+
+[Install]
+WantedBy=multi-user.target
