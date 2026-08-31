@@ -52,7 +52,25 @@ dash.partnerstack.com/teachableinc/application (login: creatorstacked@agentmail.
 > creators rather than generic "best tool" listicles. The site is new and does not have meaningful
 > traffic yet; we'd rather be upfront about that than overstate it.
 
-## Not yet researched: Kajabi, Thinkific
+## Thinkific — apply at https://dash.partnerstack.com/application?company=thinkific6979&group=generalaffiliates
 
-Same process before applying to either — check the actual current affiliate terms on their own pages,
-don't reuse a stale figure from this file or a review site.
+**Terms:** 30% lifetime recurring commission (Plus-tier referrals pay a flat $150/mo instead), 90-day
+cookie, $25 minimum payout, managed through PartnerStack. Affiliates must refer at least 1 customer
+every 3 months to stay in the program; no bidding on Thinkific's branded search terms (doesn't affect
+us, we don't run paid search at all). No stated requirement to be an existing customer.
+
+**Status 2026-08-31: SUBMITTED.** Agent filled in all informational fields (audience, industries,
+promotion plan), honestly marked audience size as "I'm just starting out" and social profiles as
+"none yet" rather than fabricating numbers. Sean did the two policy acknowledgments, accepted the
+affiliate agreement, cleared the CAPTCHA, and submitted. Confirmed on the PartnerStack dashboard:
+"Application pending" alongside Teachable (same login, same dashboard — dash.partnerstack.com/home).
+
+## Kajabi — blocked, not applied
+
+Kajabi's partner program (partners.kajabi.com/pp) appears to require being an **active paying Kajabi
+subscriber** ($143+/mo) — the page's own framing assumes you already use Kajabi, and there's no
+visible general-public application form the way Podia/Teachable/Thinkific have. Real commission is
+30% lifetime (confirmed directly on partners.kajabi.com, contradicting an aggregator's claim of "100%
+first month then 10-20% tiered" — another instance of an aggregator being wrong, not just stale).
+Applying would mean subscribing to Kajabi first, a real spend decision Sean would need to make
+explicitly (via `spend` + Link approval) — not attempted without that.
