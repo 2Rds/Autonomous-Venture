@@ -25,10 +25,10 @@ the live PartnerStack application page — teachable.com/partners itself states 
 stale relative to the actual partnerstack.com application; trust the application page over the
 marketing page), managed through PartnerStack, 2-5 business day review.
 
-**Status 2026-08-31:** application form fully filled out (business name, name, email, website,
-pitch) at the PartnerStack-hosted form — just needs the Cloudflare human-verification checkbox and
-the Submit click, both deliberately left for Sean (CAPTCHA completion is off-limits regardless of
-context; account/application submission is the same boundary as everywhere else in this doc).
+**Status 2026-08-31: SUBMITTED.** Sean created the PartnerStack login and completed the
+human-verification + submit himself. Dashboard confirms "Your application was received";
+Teachable's own review window is 2-5 business days. Track status at
+dash.partnerstack.com/teachableinc/application (login: creatorstacked@agentmail.to).
 
 **Pitch used:**
 
