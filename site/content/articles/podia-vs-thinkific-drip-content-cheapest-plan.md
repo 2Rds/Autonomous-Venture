@@ -5,6 +5,7 @@ persona: "music-teachers"
 affiliateProgram: "TBD - pending application"
 publishedAt: "2026-08-31"
 status: "draft"
+styleFlags: ""
 ---
 
 If you're running a six-week ukulele cohort or a semester of theory drills that need to unlock one module at a time, the plan you pick determines whether that's five minutes of setup or a workaround involving manual emails every Monday. Here's what the current pricing pages for Podia and Thinkific actually say, and where they stay quiet.

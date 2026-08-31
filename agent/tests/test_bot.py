@@ -614,6 +614,67 @@ def test_write_article_file_includes_all_frontmatter_fields():
     assert "This is the article body." in content
 
 
+# ---------------------------------------------------------------- style check
+
+def test_style_violations_clean_text_has_none():
+    assert bot._style_violations("This is a plain sentence about pricing tiers.") == []
+
+
+def test_style_violations_detects_em_dash():
+    assert "em dash" in bot._style_violations("A tool for creators — built for scale.")
+
+
+def test_style_violations_detects_banned_word():
+    violations = bot._style_violations("This feature will truly elevate your workflow.")
+    assert any("elevate" in v for v in violations)
+
+
+def test_style_violations_detects_negate_pivot_two_sentence():
+    text = ('The question isn\'t "which platform is cheaper." It\'s whether instructors '
+            "get their own login.")
+    assert any("negate-then-pivot" in v for v in bot._style_violations(text))
+
+
+def test_style_violations_detects_negate_pivot_comma_form():
+    text = "That's not a pricing problem, it's a feature-gap problem."
+    assert any("negate-then-pivot" in v for v in bot._style_violations(text))
+
+
+def test_style_violations_detects_closer_phrase():
+    text = "At the end of the day, both platforms cost about the same."
+    assert any("closer" in v for v in bot._style_violations(text))
+
+
+def test_style_violations_does_not_flag_unlock_as_domain_term():
+    # This niche's own vendor copy legitimately says things like this -- banning "unlock"
+    # would flag quoted domain language, not hype. See the comment above _STYLE_BANNED_PHRASES.
+    text = "Thinkific's Start plan lets you grade student work and unlock lessons as they progress."
+    assert bot._style_violations(text) == []
+
+
+def test_style_violations_does_not_flag_dive_into_as_dive_in():
+    assert bot._style_violations("We dive into the pricing page to check the claim.") == []
+
+
+def test_write_article_file_records_no_style_flags_when_clean():
+    article = bot._parse_article(VALID_ARTICLE_RAW)
+    article["date"] = "2026-08-31"
+    path = bot._write_article_file(article)
+    assert 'styleFlags: ""' in path.read_text()
+
+
+def test_write_article_file_records_style_flags_when_present():
+    raw = VALID_ARTICLE_RAW.replace(
+        "This is the article body.",
+        "This is the article body. It isn't the cheap option. It's the reliable one.",
+    )
+    article = bot._parse_article(raw)
+    article["date"] = "2026-08-31"
+    path = bot._write_article_file(article)
+    content = path.read_text()
+    assert 'styleFlags: "negate-then-pivot sentence"' in content
+
+
 def test_git_commit_and_push_no_token_still_commits_locally():
     calls = []
 
@@ -751,6 +812,17 @@ def test_list_draft_articles_excludes_non_draft_and_underscore_files():
     assert [d["slug"] for d in drafts] == ["a-draft"]
     assert drafts[0]["title"] == "A Draft"
     assert drafts[0]["description"] == "d1"
+    assert drafts[0]["styleFlags"] == ""
+
+
+def test_list_draft_articles_surfaces_style_flags():
+    bot.ARTICLES_DIR.mkdir(parents=True)
+    (bot.ARTICLES_DIR / "flagged.md").write_text(
+        '---\ntitle: "Flagged"\ndescription: "d"\nstatus: "draft"\n'
+        'styleFlags: "em dash; banned word(s): leverage"\n---\n\nbody'
+    )
+    drafts = bot._list_draft_articles()
+    assert drafts[0]["styleFlags"] == "em dash; banned word(s): leverage"
 
 
 def test_list_draft_articles_empty_when_dir_missing():
@@ -839,6 +911,19 @@ async def test_run_content_cycle_writes_and_commits():
     assert any(p.endswith("best-course-platform-fitness-coaches.md") for p in pushed_paths)
     assert "pushed to GitHub" in result
     assert (bot.ARTICLES_DIR / "best-course-platform-fitness-coaches.md").exists()
+    assert "Style check flagged" not in result  # VALID_ARTICLE_RAW's body is clean
+
+
+@pytest.mark.asyncio
+async def test_run_content_cycle_surfaces_style_warning_in_message():
+    flagged_raw = VALID_ARTICLE_RAW.replace(
+        "This is the article body.",
+        "This is the article body. It isn't the cheap option. It's the reliable one.",
+    )
+    with patch.object(bot, "_run_pipeline_research", return_value=flagged_raw):
+        with patch.object(bot, "_git_commit_and_push", return_value=(True, "pushed")):
+            result = await bot._run_content_cycle()
+    assert "Style check flagged: negate-then-pivot sentence" in result
 
 
 def test_pipeline_due_when_never_run():

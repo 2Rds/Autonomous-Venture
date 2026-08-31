@@ -5,6 +5,7 @@ persona: "cohort-creators"
 affiliateProgram: "TBD - pending application"
 publishedAt: "2026-08-31"
 status: "draft"
+styleFlags: ""
 ---
 
 Every course platform comparison leads with the monthly price, then buries the two numbers that actually decide which one is cheaper for you: the transaction fee, and what you lose if you pick the bottom tier.

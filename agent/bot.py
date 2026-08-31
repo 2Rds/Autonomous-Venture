@@ -608,6 +608,66 @@ def _parse_article(raw: str) -> dict | None:
     }
 
 
+# ---------------------------------------------------------------- style check
+#
+# The writer prompt has the human-writing skill's full rule block pasted into it
+# (_WRITING_STYLE_BLOCK above), but a prompt is not a guarantee -- live drafts from this
+# pipeline have shipped with a real negate-then-pivot sentence despite the instruction
+# banning it explicitly (found by reading the actual output, 2026-08-31, not assumed). This
+# is a mechanical, regex-only net for the subset of the skill's rules that are actually
+# grep-able (em dash, banned vocabulary, the two negate-pivot shapes, literal closer
+# phrases) -- it is NOT a style-quality check. A clean result here means none of these
+# specific patterns matched, not that the prose is good; things like a colon-bullet
+# scaffold or batch uniformity need a human read, not a regex.
+#
+# "unlock"/"unleash" are deliberately absent from the banned list: this niche's own
+# content quotes vendor pricing-page copy about lesson-unlocking mechanics verbatim (see
+# podia-vs-thinkific-drip-content-cheapest-plan.md, "unlock lessons as they progress" --
+# a direct Thinkific quote), so banning the word would flag quoted domain language, not
+# hype usage. The skill's own exception clause covers exactly this case.
+_STYLE_BANNED_PHRASES = [
+    "delve", "leverage", "utilize", "seamless", "seamlessly", "robust", "streamline",
+    "elevate", "supercharge", "empower", "harness", "foster", "holistic", "synergy",
+    "game-changer", "cutting-edge", "revolutionize", "transformative", "realm",
+    "tapestry", "journey", "ever-evolving", "in today's fast-paced world",
+    "navigate the landscape", "look no further", "let's dive in", "crucial",
+    "pivotal", "vital", "it's worth noting", "it's important to remember",
+    "arguably", "here's the kicker", "the best part", "no fluff",
+]
+_STYLE_BANNED_RE = re.compile(
+    r"\b(" + "|".join(re.escape(p) for p in _STYLE_BANNED_PHRASES) + r")\b", re.IGNORECASE,
+)
+# Two shapes from the skill's banned-pattern list: "It isn't X. It's Y." (two sentences)
+# and "not X, it's Y" (one sentence, comma-joined). Quote/bracket characters are allowed
+# between the terminal punctuation and the pivot clause so a quoted first clause (a common
+# shape in this content, e.g. isn't "which platform is cheaper." It's whether...) matches.
+_STYLE_NEGATE_PIVOT_SENTENCE_RE = re.compile(
+    r"\b(?:isn'?t|is not|aren'?t|are not|wasn'?t|weren'?t)\b[^.!?]*[.!?][\"'”’)\]]*\s*"
+    r"(?:It'?s|That'?s|They'?re|We'?re|You'?re)\b", re.IGNORECASE,
+)
+_STYLE_NEGATE_PIVOT_COMMA_RE = re.compile(
+    r"\bnot\b[^.!?,]{0,60},\s*(?:it'?s|that'?s|they'?re|we'?re|you'?re)\b", re.IGNORECASE,
+)
+_STYLE_CLOSER_RE = re.compile(
+    r"\b(?:in conclusion|ultimately|at the end of the day|the bottom line)\b", re.IGNORECASE,
+)
+
+
+def _style_violations(body: str) -> list[str]:
+    violations = []
+    if "—" in body:  # em dash
+        violations.append("em dash")
+    hit_words = sorted({m.group(0).lower() for m in _STYLE_BANNED_RE.finditer(body)})
+    if hit_words:
+        violations.append("banned word(s): " + ", ".join(hit_words))
+    if (_STYLE_NEGATE_PIVOT_SENTENCE_RE.search(body)
+            or _STYLE_NEGATE_PIVOT_COMMA_RE.search(body)):
+        violations.append("negate-then-pivot sentence")
+    if _STYLE_CLOSER_RE.search(body):
+        violations.append("summarizing closer phrase")
+    return violations
+
+
 def _write_article_file(article: dict) -> Path:
     ARTICLES_DIR.mkdir(parents=True, exist_ok=True)
     path = ARTICLES_DIR / f"{article['slug']}.md"
@@ -615,6 +675,9 @@ def _write_article_file(article: dict) -> Path:
     # could set it to "published". That is the actual enforcement point for "the pipeline
     # never publishes itself", not a policy statement elsewhere that this code could drift
     # away from. See tests/test_bot.py for the mutation-check on this.
+    # styleFlags is likewise computed here, straight from the body, not accepted as an
+    # article field -- a caller can't pass a fake "clean" result, same reasoning as status.
+    style_flags = "; ".join(_style_violations(article["body"]))
     frontmatter = (
         "---\n"
         f"title: \"{article['title']}\"\n"
@@ -623,6 +686,7 @@ def _write_article_file(article: dict) -> Path:
         f"affiliateProgram: \"{article['affiliate_program']}\"\n"
         f"publishedAt: \"{article.get('date', '')}\"\n"
         "status: \"draft\"\n"
+        f"styleFlags: \"{style_flags}\"\n"
         "---\n\n"
     )
     path.write_text(frontmatter + article["body"] + "\n")
@@ -685,10 +749,13 @@ async def _run_content_cycle() -> str:
         f"status: draft. Needs a human read before publishing.",
     )
     status_line = "pushed to GitHub" if ok else push_status
+    violations = _style_violations(article["body"])
+    style_line = (f"\n⚠️ Style check flagged: {'; '.join(violations)}. Read it closely before "
+                   f"approving." if violations else "")
     return (f"New draft: **{article['title']}** ({article['slug']})\n"
             f"{article['description']}\n"
             f"{status_line}. `drafts` won't show this one — it's a site article, not an "
-            f"email/application draft; check {rel_path} directly.")
+            f"email/application draft; check {rel_path} directly.{style_line}")
 
 
 async def _handle_pipeline() -> str:
@@ -842,6 +909,7 @@ def _list_draft_articles() -> list[dict]:
             "slug": f.stem,
             "title": fields.get("title", f.stem),
             "description": fields.get("description", ""),
+            "styleFlags": fields.get("styleFlags", ""),
         })
     return drafts
 

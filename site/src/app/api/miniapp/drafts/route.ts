@@ -30,6 +30,7 @@ export async function GET(req: Request) {
           persona: data.persona ?? "",
           affiliateProgram: data.affiliateProgram ?? "",
           publishedAt: data.publishedAt ?? "",
+          styleFlags: data.styleFlags ?? "",
         };
       })
     )

@@ -16,6 +16,7 @@ interface DraftSummary {
   slug: string;
   title: string;
   description: string;
+  styleFlags: string;
 }
 
 interface DraftDetail extends DraftSummary {
@@ -255,6 +256,12 @@ function DraftsTab({
         </button>
         <h2 className="font-semibold mb-1">{expanded.title}</h2>
         <p className="text-neutral-400 text-sm mb-3">{expanded.description}</p>
+        {expanded.styleFlags && (
+          <p className="text-amber-400 text-xs bg-amber-950/40 border border-amber-900 rounded p-2 mb-3">
+            Style check flagged: {expanded.styleFlags}. This is a mechanical check, not a
+            quality read, so scrutinize the prose yourself either way.
+          </p>
+        )}
         {editing ? (
           <textarea
             className="w-full h-64 bg-neutral-900 text-sm p-2 rounded mb-3"
@@ -305,7 +312,14 @@ function DraftsTab({
             className="w-full text-left bg-neutral-900 rounded p-3"
             onClick={() => openDraft(d.slug)}
           >
-            <div className="font-medium text-sm">{d.title}</div>
+            <div className="font-medium text-sm flex items-center gap-2">
+              {d.title}
+              {d.styleFlags && (
+                <span className="text-amber-400 text-xs border border-amber-900 rounded px-1.5">
+                  flagged
+                </span>
+              )}
+            </div>
             <div className="text-neutral-400 text-xs">{d.description}</div>
           </button>
         </li>

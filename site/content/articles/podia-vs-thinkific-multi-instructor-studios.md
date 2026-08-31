@@ -5,6 +5,7 @@ persona: "music-teachers"
 affiliateProgram: "TBD - pending application"
 publishedAt: "2026-08-31"
 status: "draft"
+styleFlags: "negate-then-pivot sentence"
 ---
 
 If you run a studio with three or four instructors teaching under one membership, the question that matters isn't "which platform is cheaper." It's whether each instructor can log in with their own account, see their own students, and get paid their own cut, or whether everything has to run through your login and your bank account.
