@@ -20,10 +20,25 @@ willingness to publish reviews/tutorials/comparisons — no discount-site partne
 
 ## Teachable — apply at https://teachable.com/partners
 
-**Terms:** 30% recurring commission for 12 months, 30-day cookie, managed through PartnerStack, 2-5
-business day review.
+**Terms:** 30% recurring commission for 12 months, **90-day cookie** (corrected 2026-08-31 against
+the live PartnerStack application page — teachable.com/partners itself states 30 days, which is
+stale relative to the actual partnerstack.com application; trust the application page over the
+marketing page), managed through PartnerStack, 2-5 business day review.
 
-**Pitch:** same as above, adjusted for Teachable's own form fields once you're on the page.
+**Status 2026-08-31:** application form fully filled out (business name, name, email, website,
+pitch) at the PartnerStack-hosted form — just needs the Cloudflare human-verification checkbox and
+the Submit click, both deliberately left for Sean (CAPTCHA completion is off-limits regardless of
+context; account/application submission is the same boundary as everywhere else in this doc).
+
+**Pitch used:**
+
+> CreatorStacked (creatorstacked.com) is a new content site reviewing tools for online course
+> creators and coaches, including Teachable, Kajabi, Podia, and Thinkific. Our first article is a
+> pricing and transaction-fee comparison across these platforms, checked directly against each
+> vendor's own pricing page rather than copied from another comparison post. Our ongoing plan is
+> persona-specific guides for fitness coaches, music teachers, consultants, and cohort-based
+> creators rather than generic "best tool" listicles. The site is new and does not have meaningful
+> traffic yet; we'd rather be upfront about that than overstate it.
 
 ## Not yet researched: Kajabi, Thinkific
 
