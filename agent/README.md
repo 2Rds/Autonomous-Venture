@@ -33,11 +33,24 @@ which a Workers V8 isolate cannot do. Matching the fleet's auth meant matching i
   a third-party platform is not something this process automates at any trust stage; Sean
   copies the draft into the form himself. This is a hard line, not a staged one — see
   `../PLAN.md` "Progress log" for why.
-- **`pause` is a real kill switch.** It gates `spend`, `draft`, `send`, and free-form chat;
-  `status`, `drafts`, `pause`, `resume`, `help` always work regardless.
+- **`pause` is a real kill switch.** It gates `spend`, `draft`, `send`, `pipeline`, and
+  free-form chat; `status`, `drafts`, `pause`, `resume`, `help` always work regardless.
+- **The content pipeline (`pipeline` command, and `content_pipeline_loop` on a schedule) is
+  where the real autonomy lives, and it's still bounded the same way.** A WebFetch+WebSearch
+  Claude call (`_pipeline_options()`) researches one new article and writes it in the required
+  `TITLE:`/`SLUG:`/.../`BODY:` format; hand-written Python (`_write_article_file`) is the only
+  thing that turns that into a file, and it hardcodes `status: "draft"` with no parameter path
+  to anything else (see the mutation-checked test
+  `test_write_article_file_ignores_any_status_the_caller_tries_to_set`). Hand-written
+  `_git_commit_and_push` commits and pushes the draft; it never touches `main` in a way that
+  publishes anything, because nothing in this repo goes live off a commit alone. Runs inside
+  this same systemd service, not inside any interactive Claude Code session, which is the
+  actual point: it keeps running whether or not anyone is watching.
 - **Next rung, not built yet:** letting the chat model decide to create spend-requests or
   drafts on its own mid-conversation (in-process tools) instead of waiting for the operator to
-  type a command. That's a deliberate later step once this stage is proven, not an oversight.
+  type a command, or the pipeline ever proposing a `status: published` flip itself instead of
+  Sean doing that by hand. Both are deliberate later steps once this stage is proven, not
+  oversights.
 
 ## Setup (needs you — none of this exists yet)
 
@@ -56,7 +69,11 @@ which a Workers V8 isolate cannot do. Matching the fleet's auth meant matching i
 5. **AgentMail** (optional — only needed for `send`, not for `draft`): create the inbox, get
    an API key and the inbox's `inbox_id` from the dashboard (not necessarily the email address
    itself) for `AGENTMAIL_API_KEY` / `AGENTMAIL_INBOX_ID`.
-6. On the droplet, `/opt/creatorstacked/agent`:
+6. **`GITHUB_TOKEN`** (optional — the content pipeline still researches and writes articles
+   locally without it, it just can't push them anywhere you'd see them): a fine-grained PAT
+   scoped to only `2Rds/Autonomous-Venture`, Contents: Read and write. Not a classic/full-access
+   token.
+7. On the droplet, `/opt/creatorstacked/agent`:
    ```
    git clone <this repo> .   # or git pull if already cloned
    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt

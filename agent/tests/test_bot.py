@@ -1,5 +1,6 @@
 import json
 import subprocess
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -17,10 +18,17 @@ def clean(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "DATA_DIR", tmp_path)
     monkeypatch.setattr(bot, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(bot, "DRAFTS_DIR", tmp_path / "drafts")
+    # ARTICLES_DIR must stay under REPO_ROOT, same invariant as production
+    # (REPO_ROOT / "site" / "content" / "articles") -- _run_content_cycle relies on it via
+    # path.relative_to(REPO_ROOT).
+    monkeypatch.setattr(bot, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(bot, "ARTICLES_DIR", tmp_path / "articles")
     monkeypatch.setattr(bot, "_state", {"paused": False})
     monkeypatch.setattr(bot, "OPERATOR_TELEGRAM_ID", OPERATOR_ID)
     monkeypatch.setattr(bot, "AGENTMAIL_API_KEY", "")
     monkeypatch.setattr(bot, "AGENTMAIL_INBOX_ID", "")
+    monkeypatch.setattr(bot, "GITHUB_TOKEN", "")
+    monkeypatch.setattr(bot, "CONTENT_PIPELINE_INTERVAL_HOURS", 168.0)
 
 
 def _fake_run(returncode=0, stdout="ok", stderr=""):
@@ -329,3 +337,221 @@ async def test_route_drafts_list_works_while_paused():
     with patch.object(bot, "_handle_drafts_list", return_value="listed"):
         result = await bot._route("drafts")
     assert result == "listed"
+
+
+# ---------------------------------------------------------------- content pipeline
+
+VALID_ARTICLE_RAW = """TITLE: Best Course Platform for Fitness Coaches
+SLUG: best-course-platform-fitness-coaches
+DESCRIPTION: A comparison focused on what fitness coaches actually need.
+PERSONA: fitness-coaches
+AFFILIATE_PROGRAM: TBD - pending application
+BODY:
+This is the article body.
+
+It has multiple paragraphs.
+"""
+
+
+def test_parse_article_valid():
+    article = bot._parse_article(VALID_ARTICLE_RAW)
+    assert article["title"] == "Best Course Platform for Fitness Coaches"
+    assert article["slug"] == "best-course-platform-fitness-coaches"
+    assert article["persona"] == "fitness-coaches"
+    assert article["affiliate_program"] == "TBD - pending application"
+    assert "This is the article body." in article["body"]
+
+
+def test_parse_article_missing_fields_returns_none():
+    assert bot._parse_article("TITLE: only a title\nno other fields") is None
+
+
+def test_parse_article_empty_body_returns_none():
+    raw = VALID_ARTICLE_RAW.replace(
+        "BODY:\nThis is the article body.\n\nIt has multiple paragraphs.\n", "BODY:\n"
+    )
+    assert bot._parse_article(raw) is None
+
+
+def test_parse_article_sanitizes_slug():
+    raw = VALID_ARTICLE_RAW.replace(
+        "SLUG: best-course-platform-fitness-coaches",
+        "SLUG: Best Course Platform! For Fitness Coaches?",
+    )
+    article = bot._parse_article(raw)
+    assert article["slug"] == "best-course-platform-for-fitness-coaches"
+
+
+def test_existing_slugs_excludes_underscore_files(tmp_path):
+    bot.ARTICLES_DIR.mkdir(parents=True)
+    (bot.ARTICLES_DIR / "real-article.md").write_text("x")
+    (bot.ARTICLES_DIR / "_template.md").write_text("x")
+    assert bot._existing_slugs() == ["real-article"]
+
+
+def test_existing_slugs_empty_when_dir_missing():
+    assert bot._existing_slugs() == []
+
+
+def test_write_article_file_always_status_draft():
+    article = bot._parse_article(VALID_ARTICLE_RAW)
+    article["date"] = "2026-08-31"
+    path = bot._write_article_file(article)
+    content = path.read_text()
+    assert 'status: "draft"' in content
+    assert 'status: "published"' not in content
+    assert 'status: "' in content and content.count('status: "') == 1  # not silently duplicated
+
+
+def test_write_article_file_ignores_any_status_the_caller_tries_to_set():
+    # The real invariant: there is no parameter path to "published" at all, not just that the
+    # default happens to be "draft". _parse_article never produces a status/status_override
+    # key (see the format it parses), but if some future caller tried to sneak one in anyway,
+    # this must still write "draft".
+    article = bot._parse_article(VALID_ARTICLE_RAW)
+    article["date"] = "2026-08-31"
+    article["status"] = "published"
+    article["status_override"] = "published"
+    path = bot._write_article_file(article)
+    content = path.read_text()
+    assert 'status: "draft"' in content
+    assert 'status: "published"' not in content
+
+
+def test_write_article_file_includes_all_frontmatter_fields():
+    article = bot._parse_article(VALID_ARTICLE_RAW)
+    article["date"] = "2026-08-31"
+    path = bot._write_article_file(article)
+    content = path.read_text()
+    assert 'title: "Best Course Platform for Fitness Coaches"' in content
+    assert 'persona: "fitness-coaches"' in content
+    assert "This is the article body." in content
+
+
+def test_git_commit_and_push_no_token_still_commits_locally():
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return _fake_run(returncode=0)
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        ok, message = bot._git_commit_and_push(["site/content/articles/x.md"], "test commit")
+    assert ok is False
+    assert "GITHUB_TOKEN" in message
+    assert any("commit" in c for c in calls)
+    assert not any("push" in c for c in calls)  # never attempts push without a token
+
+
+def test_git_commit_and_push_add_failure_stops_before_commit():
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "add" in args:
+            return _fake_run(returncode=1, stderr="add failed")
+        return _fake_run(returncode=0)
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        ok, message = bot._git_commit_and_push(["x.md"], "test")
+    assert ok is False
+    assert "add failed" in message
+    assert not any("commit" in c for c in calls)
+
+
+def test_git_commit_and_push_success_with_token(monkeypatch):
+    monkeypatch.setattr(bot, "GITHUB_TOKEN", "fake-token-value")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return _fake_run(returncode=0)
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        ok, message = bot._git_commit_and_push(["x.md"], "test")
+    assert ok is True
+    assert message == "pushed"
+    assert any("push" in c for c in calls)
+
+
+def test_git_commit_and_push_failure_redacts_token(monkeypatch):
+    monkeypatch.setattr(bot, "GITHUB_TOKEN", "super-secret-token")
+
+    def fake_run(args, **kwargs):
+        if "push" in args:
+            return _fake_run(returncode=1, stderr="fatal: auth failed for super-secret-token")
+        return _fake_run(returncode=0)
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        ok, message = bot._git_commit_and_push(["x.md"], "test")
+    assert ok is False
+    assert "super-secret-token" not in message
+    assert "***" in message
+
+
+@pytest.mark.asyncio
+async def test_run_content_cycle_unparseable_output_writes_nothing():
+    with patch.object(bot, "_run_pipeline_research", return_value="garbage output"):
+        with patch.object(bot, "_write_article_file") as mock_write:
+            result = await bot._run_content_cycle()
+    mock_write.assert_not_called()
+    assert "didn't parse" in result
+
+
+@pytest.mark.asyncio
+async def test_run_content_cycle_writes_and_commits():
+    with patch.object(bot, "_run_pipeline_research", return_value=VALID_ARTICLE_RAW):
+        with patch.object(bot, "_git_commit_and_push", return_value=(True, "pushed")) as mock_push:
+            result = await bot._run_content_cycle()
+    mock_push.assert_called_once()
+    pushed_paths = mock_push.call_args[0][0]
+    assert any(p.endswith("best-course-platform-fitness-coaches.md") for p in pushed_paths)
+    assert "pushed to GitHub" in result
+    assert (bot.ARTICLES_DIR / "best-course-platform-fitness-coaches.md").exists()
+
+
+def test_pipeline_due_when_never_run():
+    assert bot._pipeline_due() is True
+
+
+def test_pipeline_due_false_within_interval():
+    bot._state["last_pipeline_run"] = datetime.now(timezone.utc).isoformat()
+    assert bot._pipeline_due() is False
+
+
+def test_pipeline_due_true_after_interval(monkeypatch):
+    monkeypatch.setattr(bot, "CONTENT_PIPELINE_INTERVAL_HOURS", 1.0)
+    bot._state["last_pipeline_run"] = (
+        datetime.now(timezone.utc) - timedelta(hours=2)
+    ).isoformat()
+    assert bot._pipeline_due() is True
+
+
+def test_pipeline_due_true_on_corrupt_timestamp():
+    bot._state["last_pipeline_run"] = "not a real timestamp"
+    assert bot._pipeline_due() is True
+
+
+@pytest.mark.asyncio
+async def test_route_pipeline_blocked_while_paused():
+    bot._state["paused"] = True
+    with patch.object(bot, "_handle_pipeline") as mock_pipeline:
+        result = await bot._route("pipeline")
+    mock_pipeline.assert_not_called()
+    assert "Paused" in result
+
+
+@pytest.mark.asyncio
+async def test_route_pipeline_allowed_when_not_paused():
+    with patch.object(bot, "_handle_pipeline", return_value="ran") as mock_pipeline:
+        result = await bot._route("pipeline")
+    mock_pipeline.assert_called_once()
+    assert result == "ran"
+
+
+@pytest.mark.asyncio
+async def test_handle_pipeline_stamps_last_run():
+    assert "last_pipeline_run" not in bot._state
+    with patch.object(bot, "_run_content_cycle", return_value="done"):
+        await bot._handle_pipeline()
+    assert "last_pipeline_run" in bot._state

@@ -109,12 +109,28 @@ can't go live or earn until this phase happens.
   then keep reviewing a random 15-20% sample every month indefinitely, plus 100% of anything the
   automated QA below flags.
 
-## Phase 3 — Automate the loop (once Phase 1+2 prove out on a handful of articles)
+## Phase 3 — Automate the loop
 
-- `CronCreate` scheduled cloud run (weekly): refresh keyword opportunities, draft N new articles,
-  update underperforming existing ones, publish, log everything for the sampling review above.
-- Automated monthly report (SearchFit `get_visibility_overview` / PostHog) sent to you — read-only
-  oversight, not maintenance.
+**Built 2026-08-31, on `agent/bot.py`, not as originally planned.** This phase originally said
+"`CronCreate` scheduled cloud run" — that tool is session-only, tied to an interactive Claude
+Code session, and gone when the session ends. Not durable, and durability was the actual
+requirement ("I want true autonomy... without me needing to be prompted"). What's actually
+running: a scheduled loop (`content_pipeline_loop`) inside the same systemd service as the
+Telegram bot, on its own droplet, `Restart=always`. It researches one new article via
+WebSearch/WebFetch, verifies every claim against a live source the same way the first article
+was written by hand, writes it to `site/content/articles/` as `status: draft` (hardcoded, no
+parameter path to anything else, mutation-tested), and commits + pushes it. Publishing is still
+a human action — the loop only ever produces drafts. `pipeline` command runs one cycle
+on demand; the interval is `CONTENT_PIPELINE_INTERVAL_HOURS` (default weekly).
+
+SearchFit keyword refresh from the original plan is dropped, not deferred: adding a
+CreatorStacked brand would put it in AgentCorp's shared SearchFit workspace (same entanglement
+problem as the droplet/DO account earlier), and Sean's SearchFit trial expired anyway. Direct
+WebSearch/WebFetch research is the substitute and is what the first article was actually built
+with.
+
+Not yet built: an automated report (SearchFit or PostHog needed a working connection for that;
+see above) and updating underperforming existing articles rather than only adding new ones.
 
 ## Phase 4 — Monetization wiring
 
