@@ -36,6 +36,7 @@ something this bot does on its own — see README "Trust ladder".
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -712,19 +713,34 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _send_long(context.bot, chat_id, reply)
 
 
+_pipeline_task: asyncio.Task | None = None
+
+
 async def _on_startup(app: Application) -> None:
     # Plain asyncio.create_task, not Application.create_task: post_init runs during
     # initialize(), before PTB considers itself "running", and Application.create_task warns
     # (PTBUserWarning) that a task created before that point "won't be automatically awaited"
-    # by its own shutdown handling. This loop has no PTB-managed resources to clean up (just
-    # sleep + occasional subprocess calls that complete on their own), so it doesn't need
-    # PTB's bookkeeping -- systemd's SIGTERM on stop is what actually ends it.
-    asyncio.create_task(content_pipeline_loop(app), name="content_pipeline_loop")
+    # by its own shutdown handling.
+    global _pipeline_task
+    _pipeline_task = asyncio.create_task(content_pipeline_loop(app), name="content_pipeline_loop")
     log.info("content pipeline loop scheduled (every %.0fh)", CONTENT_PIPELINE_INTERVAL_HOURS)
 
 
+async def _on_shutdown(app: Application) -> None:
+    # Without this, stopping the app (including every restart) destroys the loop's task
+    # mid-sleep and asyncio logs "Task was destroyed but it is pending!" as an ERROR on every
+    # single restart -- harmless (systemd's SIGTERM ends the process either way) but noisy
+    # enough to look like a real fault when reading the journal later. Cancelling it here
+    # first gives it a clean exit instead.
+    if _pipeline_task is not None:
+        _pipeline_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _pipeline_task
+
+
 def build_app() -> Application:
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_on_startup).build()
+    app = (Application.builder().token(TELEGRAM_BOT_TOKEN)
+           .post_init(_on_startup).post_shutdown(_on_shutdown).build())
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     return app
 
