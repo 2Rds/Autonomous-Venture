@@ -713,7 +713,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def _on_startup(app: Application) -> None:
-    app.create_task(content_pipeline_loop(app), name="content_pipeline_loop")
+    # Plain asyncio.create_task, not Application.create_task: post_init runs during
+    # initialize(), before PTB considers itself "running", and Application.create_task warns
+    # (PTBUserWarning) that a task created before that point "won't be automatically awaited"
+    # by its own shutdown handling. This loop has no PTB-managed resources to clean up (just
+    # sleep + occasional subprocess calls that complete on their own), so it doesn't need
+    # PTB's bookkeeping -- systemd's SIGTERM on stop is what actually ends it.
+    asyncio.create_task(content_pipeline_loop(app), name="content_pipeline_loop")
     log.info("content pipeline loop scheduled (every %.0fh)", CONTENT_PIPELINE_INTERVAL_HOURS)
 
 
