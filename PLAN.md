@@ -183,6 +183,30 @@ Each additional site costs setup time on a reusable engine, not new ongoing effo
   `agent/README.md` "Trust ladder" for where this is enforced in code (the `draft application`
   path has no `send`).
 
+- **2026-08-31: Telegram Mini App dashboard added** (`site/src/app/dashboard`, `site/src/app/api/
+  miniapp/`, `agent/bot.py` `app` command). Covers status, spend-request visibility, and draft
+  article review/approve/edit/reject. Two decisions worth recording:
+  - **Status store is Upstash Redis, not AgentCorp's Redis Cloud.** Sean initially proposed a
+    separate instance under AgentCorp's own Redis Cloud account; on reflection that still crosses
+    the infra-separation boundary this venture was set up with (AgentCorp's account, even for one
+    unrelated instance, is still AgentCorp's infra). `2Rds/Autonomous-Venture` is also a public
+    repo, so spend-request amounts/merchants and pause state can't be git-backed either — Upstash
+    (via Vercel's marketplace integration) keeps that data out of both. The store Sean created was
+    already connected to the `creatorstacked` project on creation (confirmed live in the Vercel
+    dashboard, not assumed), and Vercel's native Upstash integration injects `KV_REST_API_URL`/
+    `KV_REST_API_TOKEN` (legacy Vercel KV naming), not `UPSTASH_REDIS_REST_URL`/`_TOKEN` as
+    originally coded — `agent/bot.py` and the dashboard's status route read the former.
+  - **No lock needed around the pipeline's write+commit+push.** Initially added an `asyncio.Lock`
+    around it on the theory that the mini app's draft approve/edit/reject (writing to `main` via
+    GitHub's Contents API, bypassing the droplet's local clone) could let two `_run_content_cycle`
+    calls interleave their git subprocess calls. Mutation-tested that assumption directly: with the
+    lock removed, a concurrency test using two overlapping cycles and a mocked commit function
+    still showed zero interleaving, because the whole write+commit+push sequence has no `await`
+    inside it — asyncio can't switch tasks mid-sequence without a yield point. Removed the lock
+    rather than keep code whose own justifying comment didn't hold up. What IS real and kept: a
+    `git fetch && git merge --ff-only origin/main` at the start of `_git_commit_and_push`, so the
+    droplet's local clone doesn't fall behind commits the mini app made directly via the API.
+
 ## What's next, concretely
 
 I can proceed right now, with no further input, on:

@@ -25,6 +25,15 @@ something the chat model can invoke itself:
                        DMs Sean. It NEVER sets status: published — see _write_article_file.
   pause / resume    — kill switch; gates spend/draft/send/pipeline/chat, never the commands
                        themselves
+  app               — opens the Telegram Mini App dashboard (status, spend-requests, and
+                       draft-article review/edit/approve). The dashboard's own backend
+                       (site/src/app/api/miniapp/) reads live status from Upstash, which this
+                       process pushes to on a timer and after every state change (see
+                       _push_status_snapshot) — never from git, since this repo is public and
+                       spend-request amounts/merchants shouldn't be. Draft approve/edit/reject
+                       goes straight to GitHub's Contents API from Vercel, not through this
+                       process, which is why _git_commit_and_push now syncs with origin/main
+                       before pushing.
 
 This is the durable-autonomy piece: content_pipeline_loop runs inside this same systemd
 service (Restart=always, its own droplet), not inside any interactive Claude Code session —
@@ -61,7 +70,7 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, TextBlock
@@ -100,6 +109,25 @@ AGENTMAIL_INBOX_ID = os.environ.get("AGENTMAIL_INBOX_ID", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 CONTENT_PIPELINE_INTERVAL_HOURS = float(os.environ.get("CONTENT_PIPELINE_INTERVAL_HOURS", "168"))
 
+# Optional — the mini-app dashboard's live status view (paused state, spend-requests, next
+# run) just doesn't update without these; the bot itself works the same either way. Never
+# git-backed: the repo is public and spend-request amounts/merchants shouldn't be. See
+# PLAN.md 2026-08-31 for why Upstash specifically (not AgentCorp's Redis Cloud — this
+# venture's infra stays unrelated to AgentCorp's on purpose).
+# Named KV_REST_API_* (not UPSTASH_REDIS_REST_*) because that's what Vercel's native Upstash
+# integration actually injects into the project -- confirmed live 2026-08-31 against the
+# creatorstacked project's own Environment Variables page, not assumed from Upstash's own
+# generic SDK docs (which use the other name for a self-managed database).
+KV_REST_API_URL = os.environ.get("KV_REST_API_URL", "").strip().rstrip("/")
+KV_REST_API_TOKEN = os.environ.get("KV_REST_API_TOKEN", "").strip()
+STATUS_PUSH_INTERVAL_SECONDS = int(os.environ.get("STATUS_PUSH_INTERVAL_SECONDS", "900"))
+STATUS_REDIS_KEY = "creatorstacked:status"
+
+# The Mini App URL, registered as the bot's menu button via @BotFather (a step Sean does
+# himself in his own Telegram client) and also served here so the `app` command works
+# without that being set up yet.
+DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "https://creatorstacked.com/dashboard")
+
 SCOPE_PROMPT = """You are the operating agent for CreatorStacked (creatorstacked.com), an
 automated content + recurring-affiliate site for online course creators and coaches (Kajabi,
 Teachable, Podia, Thinkific and similar tools). You're talking to Sean over Telegram.
@@ -129,6 +157,7 @@ HELP_TEXT = (
     "`pipeline` — run one content-pipeline cycle now (researches + drafts + commits one new "
     "article, always as status: draft; also runs on its own schedule)\n"
     "`pause` / `resume` — kill switch\n"
+    "`app` — open the dashboard (status, drafts to review, spend-requests)\n"
     "Anything else is a normal chat message to the agent (read-only — it can't act on it)."
 )
 
@@ -605,6 +634,18 @@ def _git_commit_and_push(paths: list[str], message: str) -> tuple[bool, str]:
         return subprocess.run(["git", "-C", str(REPO_ROOT), *args],
                               capture_output=True, text=True, timeout=30)
 
+    # The mini app's approve/edit/reject actions commit straight to origin/main via GitHub's
+    # API, bypassing this local clone entirely. Without syncing first, this process's next
+    # push is rejected as non-fast-forward the moment that's happened even once. A fetch
+    # failure (no network) is not fatal here -- fall through and let the push below fail with
+    # its own clear message, same as before this existed. An actual divergence is fatal: that
+    # means real conflicting history, not something to silently paper over.
+    fetch = run("fetch", "origin", "main")
+    if fetch.returncode == 0:
+        merge = run("merge", "--ff-only", "origin/main")
+        if merge.returncode != 0:
+            return False, f"local repo diverged from origin/main: {merge.stderr.strip()}"
+
     add = run("add", *paths)
     if add.returncode != 0:
         return False, f"git add failed: {add.stderr.strip()}"
@@ -632,6 +673,10 @@ async def _run_content_cycle() -> str:
         log.warning("pipeline output did not parse as an article")
         return "Pipeline ran but the output didn't parse as an article, nothing written. Raw output logged."
     article["date"] = date.today().isoformat()
+    # No lock needed around this write+commit+push: everything in it (file write, subprocess.run
+    # calls) is synchronous with no `await` inside, so asyncio can't interleave another task's
+    # equivalent sequence partway through this one -- confirmed empirically, not assumed, see
+    # PLAN.md "Progress log" 2026-08-31.
     path = _write_article_file(article)
     rel_path = str(path.relative_to(REPO_ROOT))
     ok, push_status = _git_commit_and_push(
@@ -653,6 +698,7 @@ async def _handle_pipeline() -> str:
     # again shortly after, duplicating the cycle.
     _state["last_pipeline_run"] = datetime.now(timezone.utc).isoformat()
     _save_state()
+    await _push_status_snapshot()
     return result
 
 
@@ -684,6 +730,7 @@ async def content_pipeline_loop(app: Application) -> None:
             result = "Scheduled content cycle raised an exception, check the journal."
         _state["last_pipeline_run"] = datetime.now(timezone.utc).isoformat()
         _save_state()
+        await _push_status_snapshot()
         await _send_long(app.bot, OPERATOR_TELEGRAM_ID, result)
 
 
@@ -737,20 +784,104 @@ def _handle_spend(arg: str) -> str:
     return _create_spend_request(amount_cents, merchant_name, merchant_url, reason)
 
 
-def _handle_status() -> str:
-    git_rev = subprocess.run(
+def _git_rev() -> str:
+    return subprocess.run(
         ["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"],
         capture_output=True, text=True,
     ).stdout.strip() or "no commits"
-    spend_requests = subprocess.run(
+
+
+def _spend_requests_raw() -> str:
+    return subprocess.run(
         ["link-cli", "spend-request", "list"], capture_output=True, text=True,
     ).stdout.strip() or "(none)"
+
+
+def _handle_status() -> str:
     return (
         f"paused: {_state['paused']}\n"
-        f"repo: {git_rev}\n"
+        f"repo: {_git_rev()}\n"
         f"last pipeline run: {_state.get('last_pipeline_run', 'never')}\n"
-        f"open spend-requests:\n{spend_requests}"
+        f"open spend-requests:\n{_spend_requests_raw()}"
     )
+
+
+# ---------------------------------------------------------------- mini-app status (Upstash)
+
+_FRONTMATTER_LINE_RE = re.compile(r'^([a-zA-Z_]+):\s*"?(.*?)"?$')
+
+
+def _list_draft_articles() -> list[dict]:
+    """Reads title/description straight off disk in the exact format _write_article_file
+    writes -- no YAML lib in this process's dependencies, and this is the only writer, so a
+    small hand-rolled parser matching that one format is enough (not a general frontmatter
+    parser)."""
+    if not ARTICLES_DIR.exists():
+        return []
+    drafts = []
+    for f in sorted(ARTICLES_DIR.glob("*.md")):
+        if f.stem.startswith("_"):  # templates etc., same convention as _existing_slugs
+            continue
+        try:
+            text = f.read_text()
+        except OSError:
+            continue
+        if not text.startswith("---\n"):
+            continue
+        end = text.find("\n---\n", 4)
+        if end == -1:
+            continue
+        fields: dict[str, str] = {}
+        for line in text[4:end].splitlines():
+            m = _FRONTMATTER_LINE_RE.match(line)
+            if m:
+                fields[m.group(1)] = m.group(2)
+        if fields.get("status") != "draft":
+            continue
+        drafts.append({
+            "slug": f.stem,
+            "title": fields.get("title", f.stem),
+            "description": fields.get("description", ""),
+        })
+    return drafts
+
+
+def _gather_status_snapshot() -> dict:
+    return {
+        "paused": _state["paused"],
+        "repo_rev": _git_rev(),
+        "last_pipeline_run": _state.get("last_pipeline_run"),
+        "pipeline_due": _pipeline_due(),
+        "spend_requests_raw": _spend_requests_raw(),
+        "drafts": _list_draft_articles(),
+        "pushed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _push_status_snapshot() -> None:
+    """Best-effort, always -- a failed push here must never surface as a command failure or
+    crash the pipeline/status loops. The dashboard just shows stale data until the next push
+    succeeds; nothing about the bot's own operation depends on this."""
+    if not KV_REST_API_URL or not KV_REST_API_TOKEN:
+        return
+    snapshot = _gather_status_snapshot()
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{KV_REST_API_URL}/set/{STATUS_REDIS_KEY}",
+                headers={"Authorization": f"Bearer {KV_REST_API_TOKEN}"},
+                content=json.dumps(snapshot),
+            )
+        if resp.status_code != 200:
+            log.warning("status push to Upstash failed: %s %s", resp.status_code, resp.text[:200])
+    except (httpx.HTTPError, OSError) as exc:
+        log.warning("status push to Upstash failed: %s", exc)
+
+
+async def status_push_loop() -> None:
+    while True:
+        await _push_status_snapshot()
+        await asyncio.sleep(STATUS_PUSH_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------- operator commands
@@ -767,10 +898,12 @@ async def _route(text: str) -> str:
     if lowered == "pause":
         _state["paused"] = True
         ok = _save_state()
+        await _push_status_snapshot()
         return "Paused." + ("" if ok else "\n⚠️ could not persist — a restart would resume me.")
     if lowered == "resume":
         _state["paused"] = False
         ok = _save_state()
+        await _push_status_snapshot()
         return "Resumed." + ("" if ok else "\n⚠️ could not persist — a restart would re-pause me.")
     if lowered in ("help", "commands"):
         return HELP_TEXT
@@ -780,7 +913,9 @@ async def _route(text: str) -> str:
                  "`status`/`drafts`/`resume`/`help` still work.")
 
     if lowered.startswith("spend "):
-        return _handle_spend(text[len("spend "):])
+        result = _handle_spend(text[len("spend "):])
+        await _push_status_snapshot()
+        return result
     if lowered.startswith("draft email "):
         return await _handle_draft_email(text[len("draft email "):])
     if lowered.startswith("draft application "):
@@ -803,11 +938,24 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await context.bot.send_message(chat_id=chat_id, text="I only take commands from my operator.")
         return
 
+    # Launches the Mini App -- needs an inline keyboard, which _route can't return (its
+    # contract is plain text, used by every other command and by tests). Handled here,
+    # before _route, same as the operator check above: always available, pause included,
+    # like status/drafts -- it's a read view, not an action.
+    if update.message.text.strip().lower() in ("app", "dashboard"):
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Open dashboard", web_app=WebAppInfo(url=DASHBOARD_URL)),
+        ]])
+        await context.bot.send_message(chat_id=chat_id, text="CreatorStacked dashboard:",
+                                        reply_markup=keyboard)
+        return
+
     reply = await _route(update.message.text)
     await _send_long(context.bot, chat_id, reply)
 
 
 _pipeline_task: asyncio.Task | None = None
+_status_push_task: asyncio.Task | None = None
 
 
 async def _on_startup(app: Application) -> None:
@@ -815,9 +963,11 @@ async def _on_startup(app: Application) -> None:
     # initialize(), before PTB considers itself "running", and Application.create_task warns
     # (PTBUserWarning) that a task created before that point "won't be automatically awaited"
     # by its own shutdown handling.
-    global _pipeline_task
+    global _pipeline_task, _status_push_task
     _pipeline_task = asyncio.create_task(content_pipeline_loop(app), name="content_pipeline_loop")
     log.info("content pipeline loop scheduled (every %.0fh)", CONTENT_PIPELINE_INTERVAL_HOURS)
+    _status_push_task = asyncio.create_task(status_push_loop(), name="status_push_loop")
+    log.info("status push loop scheduled (every %ds)", STATUS_PUSH_INTERVAL_SECONDS)
 
 
 async def _on_shutdown(app: Application) -> None:
@@ -826,10 +976,11 @@ async def _on_shutdown(app: Application) -> None:
     # single restart -- harmless (systemd's SIGTERM ends the process either way) but noisy
     # enough to look like a real fault when reading the journal later. Cancelling it here
     # first gives it a clean exit instead.
-    if _pipeline_task is not None:
-        _pipeline_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await _pipeline_task
+    for task in (_pipeline_task, _status_push_task):
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 def build_app() -> Application:

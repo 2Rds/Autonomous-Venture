@@ -30,6 +30,8 @@ def clean(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "AGENTMAIL_INBOX_ID", "")
     monkeypatch.setattr(bot, "GITHUB_TOKEN", "")
     monkeypatch.setattr(bot, "CONTENT_PIPELINE_INTERVAL_HOURS", 168.0)
+    monkeypatch.setattr(bot, "KV_REST_API_URL", "")
+    monkeypatch.setattr(bot, "KV_REST_API_TOKEN", "")
 
 
 def _fake_run(returncode=0, stdout="ok", stderr=""):
@@ -156,9 +158,11 @@ async def test_route_pause_then_resume():
 class FakeBot:
     def __init__(self):
         self.sent = []
+        self.calls = []  # full kwargs per send_message call, for tests that need reply_markup
 
-    async def send_message(self, chat_id, text):
+    async def send_message(self, chat_id, text=None, reply_markup=None, **kwargs):
         self.sent.append((chat_id, text))
+        self.calls.append({"chat_id": chat_id, "text": text, "reply_markup": reply_markup, **kwargs})
 
 
 def _fake_update(user_id, text):
@@ -187,6 +191,27 @@ async def test_operator_message_reaches_route():
         await bot.on_message(_fake_update(OPERATOR_ID, "status"), context)
     mock_route.assert_called_once_with("status")
     assert fake_bot.sent == [(777, "handled")]
+
+
+@pytest.mark.asyncio
+async def test_app_command_sends_web_app_button_and_never_reaches_route():
+    fake_bot = FakeBot()
+    context = SimpleNamespace(bot=fake_bot)
+    with patch.object(bot, "_route") as mock_route:
+        await bot.on_message(_fake_update(OPERATOR_ID, "app"), context)
+    mock_route.assert_not_called()
+    assert len(fake_bot.calls) == 1
+    markup = fake_bot.calls[0]["reply_markup"]
+    button = markup.inline_keyboard[0][0]
+    assert button.web_app.url == bot.DASHBOARD_URL
+
+
+@pytest.mark.asyncio
+async def test_dashboard_alias_also_sends_web_app_button():
+    fake_bot = FakeBot()
+    context = SimpleNamespace(bot=fake_bot)
+    await bot.on_message(_fake_update(OPERATOR_ID, "Dashboard"), context)
+    assert fake_bot.calls[0]["reply_markup"].inline_keyboard[0][0].web_app.url == bot.DASHBOARD_URL
 
 
 # ---------------------------------------------------------------- drafts
@@ -648,6 +673,151 @@ def test_git_commit_and_push_failure_redacts_token(monkeypatch):
     assert ok is False
     assert "super-secret-token" not in message
     assert "***" in message
+
+
+def test_git_commit_and_push_syncs_with_origin_before_add():
+    # The mini app's approve/edit/reject actions commit to origin/main via GitHub's API,
+    # bypassing this local clone -- without this sync, a later push here would be rejected as
+    # non-fast-forward. Asserts the real invariant: fetch/merge happen, and strictly before add.
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return _fake_run(returncode=0)
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        ok, _ = bot._git_commit_and_push(["x.md"], "test")
+    assert ok is False  # no GITHUB_TOKEN in the clean fixture, expected to stop before push
+    verbs = [c[3] for c in calls]  # ["git", "-C", repo_root, <verb>, ...]
+    assert verbs[0] == "fetch"
+    assert verbs[1] == "merge"
+    assert verbs.index("add") > verbs.index("merge")
+
+
+def test_git_commit_and_push_diverged_from_origin_blocks_before_any_write():
+    # A real divergence (not just "no network") must stop the whole sequence cold -- writing
+    # on top of history this clone doesn't have is exactly the bug this sync exists to prevent.
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "merge" in args:
+            return _fake_run(returncode=1, stderr="fatal: Not possible to fast-forward")
+        return _fake_run(returncode=0)
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        ok, message = bot._git_commit_and_push(["x.md"], "test")
+    assert ok is False
+    assert "diverged" in message
+    assert not any("add" in c for c in calls)
+    assert not any("commit" in c for c in calls)
+
+
+def test_git_commit_and_push_fetch_failure_is_not_fatal():
+    # No network reaching origin must behave exactly as it did before this sync existed --
+    # fall through and let add/commit/push run (and report their own failure if any), not
+    # block a local-only commit over a transient fetch failure.
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if "fetch" in args:
+            return _fake_run(returncode=1, stderr="could not resolve host")
+        return _fake_run(returncode=0)
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        ok, message = bot._git_commit_and_push(["x.md"], "test")
+    assert any("add" in c for c in calls)
+    assert any("commit" in c for c in calls)
+    assert not any("merge" in c for c in calls)  # never merges when fetch itself failed
+    assert ok is False  # still blocked on the pre-existing "no GITHUB_TOKEN" path
+    assert "GITHUB_TOKEN" in message
+
+
+# ---------------------------------------------------------------- mini-app status (Upstash)
+
+def test_list_draft_articles_excludes_non_draft_and_underscore_files():
+    bot.ARTICLES_DIR.mkdir(parents=True)
+    (bot.ARTICLES_DIR / "a-draft.md").write_text(
+        '---\ntitle: "A Draft"\ndescription: "d1"\nstatus: "draft"\n---\n\nbody'
+    )
+    (bot.ARTICLES_DIR / "b-published.md").write_text(
+        '---\ntitle: "B Published"\ndescription: "d2"\nstatus: "published"\n---\n\nbody'
+    )
+    (bot.ARTICLES_DIR / "_template.md").write_text(
+        '---\ntitle: "Template"\nstatus: "draft"\n---\n\nbody'
+    )
+    drafts = bot._list_draft_articles()
+    assert [d["slug"] for d in drafts] == ["a-draft"]
+    assert drafts[0]["title"] == "A Draft"
+    assert drafts[0]["description"] == "d1"
+
+
+def test_list_draft_articles_empty_when_dir_missing():
+    assert bot._list_draft_articles() == []
+
+
+def test_gather_status_snapshot_shape(monkeypatch):
+    monkeypatch.setattr(bot, "_state", {"paused": True, "last_pipeline_run": "2026-08-31T00:00:00+00:00"})
+    with patch.object(subprocess, "run", return_value=_fake_run(stdout="abc1234")):
+        snapshot = bot._gather_status_snapshot()
+    assert snapshot["paused"] is True
+    assert snapshot["repo_rev"] == "abc1234"
+    assert snapshot["last_pipeline_run"] == "2026-08-31T00:00:00+00:00"
+    assert isinstance(snapshot["drafts"], list)
+    assert "pushed_at" in snapshot
+
+
+@pytest.mark.asyncio
+async def test_push_status_snapshot_noop_without_config():
+    # Best-effort by design -- unconfigured must not raise or attempt a request at all.
+    with patch.object(httpx, "AsyncClient") as mock_client:
+        await bot._push_status_snapshot()
+    mock_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_push_status_snapshot_sends_authenticated_put(monkeypatch):
+    monkeypatch.setattr(bot, "KV_REST_API_URL", "https://fake-upstash.example")
+    monkeypatch.setattr(bot, "KV_REST_API_TOKEN", "fake-upstash-token")
+
+    class FakeUpstashResponse:
+        status_code = 200
+        text = "OK"
+
+    captured = {}
+
+    class FakeAsyncClient:
+        def __init__(self, timeout=None):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, content=None):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["content"] = content
+            return FakeUpstashResponse()
+
+    with patch.object(httpx, "AsyncClient", FakeAsyncClient):
+        await bot._push_status_snapshot()
+
+    assert captured["url"] == "https://fake-upstash.example/set/creatorstacked:status"
+    assert captured["headers"]["Authorization"] == "Bearer fake-upstash-token"
+    payload = json.loads(captured["content"])
+    assert "paused" in payload
+
+
+@pytest.mark.asyncio
+async def test_push_status_snapshot_swallows_connection_errors():
+    with patch.object(bot, "KV_REST_API_URL", "https://fake-upstash.example"), \
+         patch.object(bot, "KV_REST_API_TOKEN", "fake-token"), \
+         patch.object(httpx, "AsyncClient", side_effect=httpx.ConnectError("no route to host")):
+        await bot._push_status_snapshot()  # must not raise
 
 
 @pytest.mark.asyncio
