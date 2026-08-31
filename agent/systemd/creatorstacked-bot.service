@@ -24,7 +24,11 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 # .data/ (pause state) must exist before first start — deploy runbook step 4.
-ReadWritePaths=/opt/creatorstacked/agent/.data /home/agentbot
+# The whole repo (not just agent/.data) is listed here, not just site/content/articles --
+# found live in production (first real scheduled pipeline run hit OSError: Errno 30
+# Read-only file system writing the article): git needs write access to .git/ internals
+# for commits too, not just the working-tree file the article itself lands in.
+ReadWritePaths=/opt/creatorstacked /home/agentbot
 # Hide the credential file from the process; EnvironmentFile= is read by the manager
 # before namespacing, so the env vars still arrive.
 InaccessiblePaths=-/opt/creatorstacked/agent/.env
