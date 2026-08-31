@@ -5,18 +5,30 @@ each program's own pages on 2026-08-31; commission terms below, not from a third
 
 ## Podia — apply at https://affiliates.podia.com/ (Typeform)
 
-**Terms:** 20% recurring commission, capped at 12 months, 31-day cookie. Not application-gated on being
-an existing customer. Stated selection criteria: quality content, a real editorial calendar, and a
-willingness to publish reviews/tutorials/comparisons — no discount-site partnerships.
+**Terms:** 20% recurring commission, capped at 12 months, 30-day payout, $50 minimum payout, 31-day
+cookie (all confirmed on the actual terms-agreement screen of the application itself, 2026-08-31).
+Not application-gated on being an existing customer. Stated selection criteria: quality content, a
+real editorial calendar, and a willingness to publish reviews/tutorials/comparisons — no
+discount-site partnerships.
 
-**Pitch to use in the open-ended "tell us about yourself" field:**
+**Status 2026-08-31: SUBMITTED.** Filled in by the agent (email, website, audience, promotion plan);
+Sean did the terms agreement and Submit himself. Confirmation: "We've received your application and
+will review it shortly." No stated review-window length on Podia's side (Teachable states 2-5
+business days; Podia doesn't).
 
-> CreatorStacked (creatorstacked.com) is a new content site reviewing tools for online course creators
-> and coaches — Kajabi, Teachable, Podia, Thinkific and similar. First article is a pricing/fee
-> comparison across the three platforms, checked directly against each vendor's own pricing page rather
-> than copied from another comparison post. Ongoing plan is persona-specific guides (fitness coaches,
-> music teachers, consultants, cohort-based creators) rather than generic "best tool" listicles. The
-> site is new and has no traffic yet — flagging that honestly rather than overstating it.
+**Pitch used (audience + promotion questions):**
+
+> Our audience is online course creators and coaches evaluating platforms like Podia, Kajabi,
+> Teachable, and Thinkific, specifically fitness coaches, music teachers, consultants, and
+> cohort-based course creators. CreatorStacked is a new site with no meaningful traffic or following
+> yet, we're being upfront about that rather than overstating it. Content is published on the site
+> itself (creatorstacked.com), with SEO as the primary discovery channel going forward.
+>
+> Through in-depth written content on creatorstacked.com: pricing and fee comparisons,
+> persona-specific guides, and feature comparisons between Podia and other course platforms. Podia
+> links get placed contextually within articles where the platform is actually the right
+> recommendation, not as blanket promotion. Growth channel is organic search rather than social or
+> paid.
 
 ## Teachable — apply at https://teachable.com/partners
 
