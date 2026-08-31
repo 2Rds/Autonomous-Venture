@@ -48,6 +48,11 @@ except PermissionError:
 
 log = logging.getLogger("creatorstacked-bot")
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+# httpx logs the full request URL at INFO, and the Telegram Bot API embeds the bot token
+# directly in the URL path (api.telegram.org/bot<TOKEN>/...) -- left at INFO, every request
+# writes the token to the journal in plaintext. This is the only line standing between that
+# and every log line the app itself emits, so it stays above LOG_LEVEL regardless of setting.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 DATA_DIR = Path(__file__).parent / ".data"
 STATE_FILE = DATA_DIR / "state.json"
