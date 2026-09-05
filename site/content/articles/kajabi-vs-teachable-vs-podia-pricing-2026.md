@@ -4,7 +4,7 @@ description: "The sticker price isn't the real cost. Transaction fees and produc
 persona: "cohort-creators"
 affiliateProgram: "TBD - pending application"
 publishedAt: "2026-08-31"
-status: "draft"
+status: "published"
 styleFlags: ""
 ---
 
@@ -39,3 +39,4 @@ Podia's entry tier is the one most likely to surprise you. It's not the "sell un
 ## The actual question
 
 None of these is "the cheapest platform" in general. It depends on volume. Below roughly $1,500/month in course revenue, the lower sticker price usually wins even with a transaction fee attached. Above that, a $0-fee tier starts paying for itself. Match the plan to what you're actually going to sell in year one, not the platform's homepage pitch.
+

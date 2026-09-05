@@ -4,7 +4,7 @@ description: "A look at what Podia's single unified plan and Thinkific's entry t
 persona: "music-teachers"
 affiliateProgram: "TBD - pending application"
 publishedAt: "2026-08-31"
-status: "draft"
+status: "published"
 styleFlags: ""
 ---
 
@@ -34,3 +34,4 @@ Neither pricing page states "drip content" as a named, confirmed feature on any 
 - Thinkific: progress-style "completion" tracking is stated on Basic at $40/mo. A lesson-unlock mechanic is stated, but only starting at Start, $82/mo, and it's tied to assignment grading rather than a calendar-based drip.
 
 If weekly, calendar-based unlocking is the specific thing you're building around, the honest next step is a five-minute test account on each platform. Build one fake module with a scheduled release date and watch what actually happens. That's a better answer than anything either pricing page will give you, and it costs nothing during Podia's 30-day trial or Thinkific's free trial period. For a teacher running paid cohorts, that half hour of testing is cheaper than finding out in week three of a live course that the unlock didn't work the way the plan implied.
+
