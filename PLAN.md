@@ -118,10 +118,11 @@ requirement ("I want true autonomy... without me needing to be prompted"). What'
 running: a scheduled loop (`content_pipeline_loop`) inside the same systemd service as the
 Telegram bot, on its own droplet, `Restart=always`. It researches one new article via
 WebSearch/WebFetch, verifies every claim against a live source the same way the first article
-was written by hand, writes it to `site/content/articles/` as `status: draft` (hardcoded, no
-parameter path to anything else, mutation-tested), and commits + pushes it. Publishing is still
-a human action — the loop only ever produces drafts. `pipeline` command runs one cycle
-on demand; the interval is `CONTENT_PIPELINE_INTERVAL_HOURS` (default weekly).
+was written by hand, runs a mechanical style self-correction loop, writes it to
+`site/content/articles/` as `status: published`, and commits + pushes it, which Vercel
+auto-deploys. Publishing was a human action through 2026-09-04; widened to autonomous
+2026-09-05, see "Progress log" below for why. `pipeline` command runs one cycle on demand;
+the interval is `CONTENT_PIPELINE_INTERVAL_HOURS` (default weekly).
 
 SearchFit keyword refresh from the original plan is dropped, not deferred: adding a
 CreatorStacked brand would put it in AgentCorp's shared SearchFit workspace (same entanglement
@@ -206,6 +207,28 @@ Each additional site costs setup time on a reusable engine, not new ongoing effo
     rather than keep code whose own justifying comment didn't hold up. What IS real and kept: a
     `git fetch && git merge --ff-only origin/main` at the start of `_git_commit_and_push`, so the
     droplet's local clone doesn't fall behind commits the mini app made directly via the API.
+
+- **2026-09-05: pipeline auto-publishes now, at Sean's explicit direction** ("I should not have
+  to approve drafts... it should be a self correcting loop"). Trigger for the ask: three days
+  after the mini app shipped, nothing autonomous had happened toward the actual business other
+  than the (still-weekly-scheduled) pipeline sitting idle and a status-push loop silently no-op'ing
+  the whole time because `KV_REST_API_URL`/`KV_REST_API_TOKEN` never made it into the droplet's
+  `.env` — a gap I should have verified landed, not just told Sean to do and assumed. The pending
+  drafts sitting in the dashboard waiting on manual approval read as more of the same "not actually
+  autonomous" pattern to him, even though that gate was a deliberate trust-ladder rung, not an
+  oversight.
+  - `_self_correct_style` (bot.py): iterates the writer's own body through a fix-and-recheck pass
+    against `_style_violations`, up to `STYLE_FIX_MAX_ATTEMPTS` (default 3) times. `_run_content_cycle`
+    now sets `status: "published"` unconditionally after this loop runs, whether or not it fully
+    converged — a residual flag after exhausting attempts is recorded in `styleFlags` and the
+    Telegram message for visibility, not held back as a gate. `_write_article_file` still defaults
+    to `"draft"` if a caller omits status, so a bug fails closed rather than silently publishing.
+  - This retires the mutation-tested "pipeline never sets status: published" invariant from
+    2026-08-30 on purpose — see `agent/README.md` "Trust ladder" for the updated description and
+    `agent/tests/test_bot.py` for the tests that replaced the old ones.
+  - The three drafts already sitting in the repo before this change were run through the same
+    self-correction-then-publish path as a one-time backlog clear, not left waiting on a manual
+    approval step that no longer exists.
 
 ## What's next, concretely
 

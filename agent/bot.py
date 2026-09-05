@@ -20,9 +20,13 @@ something the chat model can invoke itself:
                        first. Refuses `application`-kind drafts unconditionally.
   drafts            — list open (unsent) drafts
   pipeline          — run one content-pipeline cycle now (also runs on a schedule, see
-                       content_pipeline_loop). Researches one new article, writes it to
-                       site/content/articles/ as status: draft, commits and pushes it, and
-                       DMs Sean. It NEVER sets status: published — see _write_article_file.
+                       content_pipeline_loop). Researches one new article, runs it through
+                       _self_correct_style (rewrites flagged sentences up to
+                       STYLE_FIX_MAX_ATTEMPTS times), writes it to site/content/articles/ as
+                       status: published, commits and pushes it, and DMs Sean either way --
+                       publishing is not gated on the style check converging, only informed
+                       by it. Widened from "always draft, human approves" to this on
+                       2026-09-05 at Sean's explicit direction; see PLAN.md "Progress log".
   pause / resume    — kill switch; gates spend/draft/send/pipeline/chat, never the commands
                        themselves
   app               — opens the Telegram Mini App dashboard (status, spend-requests, and
@@ -50,10 +54,13 @@ disallowed_tools, and only worked with an explicit allowed_tools entry — Brows
 such ambiguity since it's not an Agent SDK tool at all, just a subprocess this code controls.
 
 Scope is fixed: content/affiliate for course-creator/coaching tools only. See ../PLAN.md.
-Widening scope further (a new business domain, direct payment processing, autonomous
-LLM-initiated spend or send instead of an operator-issued command, or the pipeline ever
-setting status: published itself) is a deliberate later step on the trust ladder, not
-something this bot does on its own — see README "Trust ladder".
+Widening scope further (a new business domain, direct payment processing, or autonomous
+LLM-initiated spend or send instead of an operator-issued command) is a deliberate later
+step on the trust ladder, not something this bot does on its own — see README "Trust
+ladder". The pipeline publishing itself WAS on that list; it was deliberately moved off it
+2026-09-05 (see PLAN.md "Progress log") once a self-correction loop existed to make
+autonomous publishing a considered tradeoff rather than raw model output going live
+unread.
 """
 
 import asyncio
@@ -154,8 +161,8 @@ HELP_TEXT = (
     "answers for you to submit yourself (there is no send for this one, ever)\n"
     "`send <id>` — send an email draft via AgentMail (only works on `email` drafts)\n"
     "`drafts` — list open drafts\n"
-    "`pipeline` — run one content-pipeline cycle now (researches + drafts + commits one new "
-    "article, always as status: draft; also runs on its own schedule)\n"
+    "`pipeline` — run one content-pipeline cycle now (researches, self-corrects style "
+    "issues, publishes live; also runs on its own schedule)\n"
     "`pause` / `resume` — kill switch\n"
     "`app` — open the dashboard (status, drafts to review, spend-requests)\n"
     "Anything else is a normal chat message to the agent (read-only — it can't act on it)."
@@ -668,15 +675,53 @@ def _style_violations(body: str) -> list[str]:
     return violations
 
 
+# Self-correction, not a gate: publish happens either way (see PLAN.md 2026-09-05 -- Sean
+# widened the trust ladder explicitly, "I should not have to approve drafts"). This loop is
+# what makes that safe to do without just shipping whatever the writer pass produced -- it
+# rewrites specifically the flagged sentences/words, re-checks, and repeats up to a bound.
+STYLE_FIX_MAX_ATTEMPTS = int(os.environ.get("STYLE_FIX_MAX_ATTEMPTS", "3"))
+
+_STYLE_FIX_SYSTEM_PROMPT = f"""{SCOPE_PROMPT}
+
+{_WRITING_STYLE_BLOCK}
+
+You are revising an already-written CreatorStacked article to remove specific mechanical
+style violations found in it. You are not writing a new article and not changing what it
+claims, only fixing the flagged sentences or words while preserving every fact, the
+persona, and the rest of the prose as closely as possible.
+
+Output ONLY the corrected article body in markdown. No frontmatter, no preamble, no
+explanation of what you changed."""
+
+
+async def _self_correct_style(body: str) -> tuple[str, list[str]]:
+    """Iterates the fix pass until _style_violations comes back clean or
+    STYLE_FIX_MAX_ATTEMPTS is exhausted. Returns the (possibly rewritten) body and whatever
+    violations remain -- empty if it converged, non-empty if the bound was hit. The caller
+    publishes either way; a non-empty return is visibility for Sean, not a block."""
+    violations = _style_violations(body)
+    attempts = 0
+    while violations and attempts < STYLE_FIX_MAX_ATTEMPTS:
+        attempts += 1
+        fix_prompt = (f"Violations found: {'; '.join(violations)}\n\n"
+                      f"Article body:\n\n{body}\n\nRewrite it to remove exactly those "
+                      f"violations.")
+        body = (await _run_pipeline_llm(_STYLE_FIX_SYSTEM_PROMPT, fix_prompt)).strip()
+        violations = _style_violations(body)
+    return body, violations
+
+
 def _write_article_file(article: dict) -> Path:
     ARTICLES_DIR.mkdir(parents=True, exist_ok=True)
     path = ARTICLES_DIR / f"{article['slug']}.md"
-    # status is hardcoded to "draft" here, full stop -- this function has no parameter that
-    # could set it to "published". That is the actual enforcement point for "the pipeline
-    # never publishes itself", not a policy statement elsewhere that this code could drift
-    # away from. See tests/test_bot.py for the mutation-check on this.
-    # styleFlags is likewise computed here, straight from the body, not accepted as an
-    # article field -- a caller can't pass a fake "clean" result, same reasoning as status.
+    # Sean explicitly widened the trust ladder 2026-09-05 ("I should not have to approve
+    # drafts... it should be a self correcting loop") -- status now comes from the caller
+    # (_run_content_cycle, after _self_correct_style has had its attempts), not hardcoded to
+    # "draft" the way it used to be. Still defaults to "draft" if a caller doesn't set it,
+    # so a bug that drops the key fails closed rather than silently publishing.
+    # styleFlags is computed here regardless, straight from the body -- a caller can't pass
+    # a fake "clean" result, same reasoning that used to apply to status.
+    status = article.get("status", "draft")
     style_flags = "; ".join(_style_violations(article["body"]))
     frontmatter = (
         "---\n"
@@ -685,7 +730,7 @@ def _write_article_file(article: dict) -> Path:
         f"persona: \"{article['persona']}\"\n"
         f"affiliateProgram: \"{article['affiliate_program']}\"\n"
         f"publishedAt: \"{article.get('date', '')}\"\n"
-        "status: \"draft\"\n"
+        f"status: \"{status}\"\n"
         f"styleFlags: \"{style_flags}\"\n"
         "---\n\n"
     )
@@ -737,6 +782,13 @@ async def _run_content_cycle() -> str:
         log.warning("pipeline output did not parse as an article")
         return "Pipeline ran but the output didn't parse as an article, nothing written. Raw output logged."
     article["date"] = date.today().isoformat()
+    article["body"], remaining_violations = await _self_correct_style(article["body"])
+    # Publishes itself now, no human gate -- Sean's explicit call 2026-09-05 ("I should not
+    # have to approve drafts... it should be a self correcting loop"). _self_correct_style
+    # above is what makes that a considered tradeoff rather than just shipping raw model
+    # output: it already tried up to STYLE_FIX_MAX_ATTEMPTS rewrites. remaining_violations
+    # being non-empty means the bound was hit, not that nothing was tried.
+    article["status"] = "published"
     # No lock needed around this write+commit+push: everything in it (file write, subprocess.run
     # calls) is synchronous with no `await` inside, so asyncio can't interleave another task's
     # equivalent sequence partway through this one -- confirmed empirically, not assumed, see
@@ -745,17 +797,16 @@ async def _run_content_cycle() -> str:
     rel_path = str(path.relative_to(REPO_ROOT))
     ok, push_status = _git_commit_and_push(
         [rel_path],
-        f"Pipeline draft: {article['title']}\n\nAuto-generated by the content pipeline, "
-        f"status: draft. Needs a human read before publishing.",
+        f"Pipeline: {article['title']}\n\nAuto-generated and auto-published by the content "
+        f"pipeline.",
     )
     status_line = "pushed to GitHub" if ok else push_status
-    violations = _style_violations(article["body"])
-    style_line = (f"\n⚠️ Style check flagged: {'; '.join(violations)}. Read it closely before "
-                   f"approving." if violations else "")
-    return (f"New draft: **{article['title']}** ({article['slug']})\n"
+    style_line = (f"\n⚠️ Style check still flagged after {STYLE_FIX_MAX_ATTEMPTS} "
+                   f"self-correction attempt(s): {'; '.join(remaining_violations)}. Published "
+                   f"anyway -- take a look when you can." if remaining_violations else "")
+    return (f"New article published: **{article['title']}** ({article['slug']})\n"
             f"{article['description']}\n"
-            f"{status_line}. `drafts` won't show this one — it's a site article, not an "
-            f"email/application draft; check {rel_path} directly.{style_line}")
+            f"{status_line}. Live on creatorstacked.com.{style_line}")
 
 
 async def _handle_pipeline() -> str:

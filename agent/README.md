@@ -36,21 +36,28 @@ which a Workers V8 isolate cannot do. Matching the fleet's auth meant matching i
 - **`pause` is a real kill switch.** It gates `spend`, `draft`, `send`, `pipeline`, and
   free-form chat; `status`, `drafts`, `pause`, `resume`, `help` always work regardless.
 - **The content pipeline (`pipeline` command, and `content_pipeline_loop` on a schedule) is
-  where the real autonomy lives, and it's still bounded the same way.** A WebFetch+WebSearch
-  Claude call (`_pipeline_options()`) researches one new article and writes it in the required
-  `TITLE:`/`SLUG:`/.../`BODY:` format; hand-written Python (`_write_article_file`) is the only
-  thing that turns that into a file, and it hardcodes `status: "draft"` with no parameter path
-  to anything else (see the mutation-checked test
-  `test_write_article_file_ignores_any_status_the_caller_tries_to_set`). Hand-written
-  `_git_commit_and_push` commits and pushes the draft; it never touches `main` in a way that
-  publishes anything, because nothing in this repo goes live off a commit alone. Runs inside
-  this same systemd service, not inside any interactive Claude Code session, which is the
-  actual point: it keeps running whether or not anyone is watching.
+  where the real autonomy lives, and as of 2026-09-05 it publishes itself.** A Browser
+  Run-backed Claude call (`_pipeline_options()`) researches one new article and writes it in
+  the required `TITLE:`/`SLUG:`/.../`BODY:` format. Before anything is written, `_style_
+  violations` (a mechanical, regex-only check for the human-writing skill's grep-able rules —
+  em dash, banned vocabulary, negate-then-pivot, literal closer phrases) runs against the
+  body, and `_self_correct_style` iterates a fix-and-recheck pass up to
+  `STYLE_FIX_MAX_ATTEMPTS` times if it finds anything. `_write_article_file` then writes
+  `status: "published"` (still defaults to `"draft"` if a caller doesn't set it, so a bug
+  fails closed rather than silently publishing) and `_git_commit_and_push` pushes straight to
+  `main`, which Vercel auto-deploys — live on creatorstacked.com within the same cycle, no
+  approval step. If the self-correction loop hits its bound with violations still present, it
+  publishes anyway and says so in the Telegram message and the article's own `styleFlags`
+  frontmatter field (also shown in the Mini App dashboard) — visibility, not a gate. This was
+  a deliberate widening at Sean's explicit direction ("I should not have to approve drafts...
+  it should be a self correcting loop") once the self-correction loop existed to make it a
+  considered tradeoff rather than raw model output going live unread; see `../PLAN.md`
+  "Progress log" 2026-09-05. Runs inside this same systemd service, not inside any
+  interactive Claude Code session, which is the actual point: it keeps running whether or not
+  anyone is watching.
 - **Next rung, not built yet:** letting the chat model decide to create spend-requests or
   drafts on its own mid-conversation (in-process tools) instead of waiting for the operator to
-  type a command, or the pipeline ever proposing a `status: published` flip itself instead of
-  Sean doing that by hand. Both are deliberate later steps once this stage is proven, not
-  oversights.
+  type a command. A deliberate later step once this stage is proven, not an oversight.
 
 ## Setup (needs you — none of this exists yet)
 

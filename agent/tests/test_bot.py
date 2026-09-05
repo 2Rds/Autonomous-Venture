@@ -579,29 +579,29 @@ async def test_run_pipeline_research_unparseable_plan_returns_raw():
     assert result == "not a valid plan format"
 
 
-def test_write_article_file_always_status_draft():
+def test_write_article_file_defaults_to_draft_when_caller_omits_status():
+    # Fail-closed default: a caller that forgets to set status (a bug) must not accidentally
+    # publish. _run_content_cycle is the only caller that sets "published", explicitly, after
+    # _self_correct_style has run -- this is the safety net for every other/future caller.
     article = bot._parse_article(VALID_ARTICLE_RAW)
     article["date"] = "2026-08-31"
     path = bot._write_article_file(article)
     content = path.read_text()
     assert 'status: "draft"' in content
-    assert 'status: "published"' not in content
     assert 'status: "' in content and content.count('status: "') == 1  # not silently duplicated
 
 
-def test_write_article_file_ignores_any_status_the_caller_tries_to_set():
-    # The real invariant: there is no parameter path to "published" at all, not just that the
-    # default happens to be "draft". _parse_article never produces a status/status_override
-    # key (see the format it parses), but if some future caller tried to sneak one in anyway,
-    # this must still write "draft".
+def test_write_article_file_honors_caller_supplied_status():
+    # Reversed from the pre-2026-09-05 invariant on purpose (Sean: "I should not have to
+    # approve drafts... it should be a self correcting loop") -- status now genuinely comes
+    # from the caller, not hardcoded. See PLAN.md "Progress log" 2026-09-05.
     article = bot._parse_article(VALID_ARTICLE_RAW)
     article["date"] = "2026-08-31"
     article["status"] = "published"
-    article["status_override"] = "published"
     path = bot._write_article_file(article)
     content = path.read_text()
-    assert 'status: "draft"' in content
-    assert 'status: "published"' not in content
+    assert 'status: "published"' in content
+    assert 'status: "draft"' not in content
 
 
 def test_write_article_file_includes_all_frontmatter_fields():
@@ -673,6 +673,46 @@ def test_write_article_file_records_style_flags_when_present():
     path = bot._write_article_file(article)
     content = path.read_text()
     assert 'styleFlags: "negate-then-pivot sentence"' in content
+
+
+# ---------------------------------------------------------------- self-correction loop
+
+@pytest.mark.asyncio
+async def test_self_correct_style_skips_llm_call_when_already_clean():
+    with patch.object(bot, "_run_pipeline_llm") as mock_llm:
+        body, violations = await bot._self_correct_style("A plain sentence about pricing.")
+    mock_llm.assert_not_called()
+    assert violations == []
+    assert body == "A plain sentence about pricing."
+
+
+@pytest.mark.asyncio
+async def test_self_correct_style_converges_on_first_fix():
+    flagged = "It isn't the cheap option. It's the reliable one."
+    with patch.object(bot, "_run_pipeline_llm", return_value="The reliable option costs more.") as mock_llm:
+        body, violations = await bot._self_correct_style(flagged)
+    mock_llm.assert_called_once()
+    assert violations == []
+    assert body == "The reliable option costs more."
+
+
+@pytest.mark.asyncio
+async def test_self_correct_style_stops_at_max_attempts_when_never_clean():
+    flagged = "It isn't the cheap option. It's the reliable one."
+    with patch.object(bot, "_run_pipeline_llm", return_value=flagged) as mock_llm:
+        body, violations = await bot._self_correct_style(flagged)
+    assert mock_llm.call_count == bot.STYLE_FIX_MAX_ATTEMPTS
+    assert violations == ["negate-then-pivot sentence"]
+    assert body == flagged
+
+
+@pytest.mark.asyncio
+async def test_self_correct_style_passes_violations_to_the_fix_prompt():
+    with patch.object(bot, "_run_pipeline_llm", return_value="Fixed.") as mock_llm:
+        await bot._self_correct_style("It isn't cheap. It's fine.")
+    user_prompt = mock_llm.call_args[0][1]
+    assert "negate-then-pivot sentence" in user_prompt
+    assert "It isn't cheap. It's fine." in user_prompt
 
 
 def test_git_commit_and_push_no_token_still_commits_locally():
@@ -904,26 +944,57 @@ async def test_run_content_cycle_unparseable_output_writes_nothing():
 @pytest.mark.asyncio
 async def test_run_content_cycle_writes_and_commits():
     with patch.object(bot, "_run_pipeline_research", return_value=VALID_ARTICLE_RAW):
-        with patch.object(bot, "_git_commit_and_push", return_value=(True, "pushed")) as mock_push:
-            result = await bot._run_content_cycle()
+        with patch.object(bot, "_run_pipeline_llm") as mock_fix_llm:
+            with patch.object(bot, "_git_commit_and_push", return_value=(True, "pushed")) as mock_push:
+                result = await bot._run_content_cycle()
+    mock_fix_llm.assert_not_called()  # VALID_ARTICLE_RAW's body is clean, no fix pass needed
     mock_push.assert_called_once()
     pushed_paths = mock_push.call_args[0][0]
     assert any(p.endswith("best-course-platform-fitness-coaches.md") for p in pushed_paths)
     assert "pushed to GitHub" in result
-    assert (bot.ARTICLES_DIR / "best-course-platform-fitness-coaches.md").exists()
-    assert "Style check flagged" not in result  # VALID_ARTICLE_RAW's body is clean
+    assert "published" in result.lower()
+    written = (bot.ARTICLES_DIR / "best-course-platform-fitness-coaches.md").read_text()
+    assert 'status: "published"' in written
+    assert "Style check" not in result
 
 
 @pytest.mark.asyncio
-async def test_run_content_cycle_surfaces_style_warning_in_message():
+async def test_run_content_cycle_self_corrects_then_publishes_clean():
     flagged_raw = VALID_ARTICLE_RAW.replace(
         "This is the article body.",
         "This is the article body. It isn't the cheap option. It's the reliable one.",
     )
     with patch.object(bot, "_run_pipeline_research", return_value=flagged_raw):
-        with patch.object(bot, "_git_commit_and_push", return_value=(True, "pushed")):
-            result = await bot._run_content_cycle()
-    assert "Style check flagged: negate-then-pivot sentence" in result
+        with patch.object(bot, "_run_pipeline_llm",
+                           return_value="This is the fixed article body.") as mock_fix_llm:
+            with patch.object(bot, "_git_commit_and_push", return_value=(True, "pushed")):
+                result = await bot._run_content_cycle()
+    mock_fix_llm.assert_called_once()
+    assert "Style check" not in result  # converged, nothing left to warn about
+    written = (bot.ARTICLES_DIR / "best-course-platform-fitness-coaches.md").read_text()
+    assert 'status: "published"' in written
+    assert 'styleFlags: ""' in written
+
+
+@pytest.mark.asyncio
+async def test_run_content_cycle_publishes_anyway_when_self_correction_cant_converge():
+    flagged_raw = VALID_ARTICLE_RAW.replace(
+        "This is the article body.",
+        "This is the article body. It isn't the cheap option. It's the reliable one.",
+    )
+    # Fix pass returns the exact same still-flagged text every time -- never converges.
+    with patch.object(bot, "_run_pipeline_research", return_value=flagged_raw):
+        with patch.object(bot, "_run_pipeline_llm",
+                           return_value=flagged_raw.split("BODY:\n")[1]) as mock_fix_llm:
+            with patch.object(bot, "_git_commit_and_push", return_value=(True, "pushed")):
+                result = await bot._run_content_cycle()
+    assert mock_fix_llm.call_count == bot.STYLE_FIX_MAX_ATTEMPTS
+    assert "Style check still flagged after 3 self-correction attempt(s)" in result
+    assert "negate-then-pivot sentence" in result
+    written = (bot.ARTICLES_DIR / "best-course-platform-fitness-coaches.md").read_text()
+    # Publishes anyway -- this is visibility, not a gate.
+    assert 'status: "published"' in written
+    assert 'styleFlags: "negate-then-pivot sentence"' in written
 
 
 def test_pipeline_due_when_never_run():
